@@ -50,9 +50,38 @@ close before a short forward scan.
 
 A delete does not erase the key. It writes a tombstone, a marker that outlives
 the memtable so that after a flush it still shadows an older value the same key
-may hold in an on-disk table. Tombstones are dropped only by a full compaction,
-which merges every table into one and, with no older table left to shadow, can
-finally discard them.
+may hold in an on-disk table. A tombstone is dropped only when a merge lands it in
+the deepest populated level, where no older table survives for it to shadow.
+
+## Levels
+
+On-disk tables are organised into levels, which is what keeps a compaction from
+rewriting the whole store. A flush drops a table into level 0. Level-0 tables come
+straight from the memtable and may overlap each other in key range. Every level
+below is a single run: its tables hold disjoint key ranges, so at most one table
+per level can hold a given key. For any key a shallower level is newer than a
+deeper one, because a key only reaches level L+1 by being merged down out of level
+L, and the merge lets the shallower copy win.
+
+Two triggers move data down. When level 0 reaches four tables it is merged into
+level 1. When a deeper level exceeds its table budget, one of its tables is merged
+into the level below, rewriting only the tables there that overlap it. Each level's
+budget is four times the one above, so the number of levels stays logarithmic in
+the data size and a read touches about one table per level plus the level-0 stack.
+A merge keeps the newest value per key and, when it is landing in the deepest
+populated level, discards tombstones.
+
+The name and level of each file are the whole manifest. A table is
+`sst-<level>-<sequence>.sst`, so `open` rebuilds the levels from the directory
+listing alone: the level says which level a table belongs to, and the sequence
+orders the level-0 tables newest first. No separate manifest file is kept.
+
+This does less work per compaction than a single full merge, so it lowers write
+amplification, and it bounds read amplification. It is an honest simplification of
+a real engine, though. Level-0 tables usually span most of the key range, so an
+L0-into-L1 merge still tends to rewrite much of level 1, and the store is still
+single-writer and still pauses the writer for the length of a compaction rather
+than running it in the background.
 
 ## Build and test
 
@@ -98,8 +127,14 @@ Done, the durable write path over a memtable that now spills to disk:
 - **SSTables.** A documented block format with a sparse index and a bloom filter
   per table, so a read skips a table that cannot hold the key and seeks close to
   it in the table that can. Tombstones shadow older values across the boundary.
-- **Compaction.** A full merge of every SSTable into one that keeps the newest
-  value per key and discards tombstones once no older table survives them.
+- **Leveled compaction.** Tables are organised into levels, level 0 straight from
+  flushes and each level below a disjoint run whose budget is four times the one
+  above. Level 0 merges into level 1 at four tables; a deeper level over its budget
+  sends one table down into the overlapping tables below it. A merge keeps the
+  newest value per key and drops a tombstone once it reaches the deepest populated
+  level. It does less work per compaction than a full merge, so it lowers write
+  amplification, and the levels persist through the file names so a reopen rebuilds
+  them.
 - **Ordered scans.** `scan(from, to)` returns the live pairs with key in
   `[from, to)` in ascending key order, `null` on either bound meaning open on that
   side. It is a k-way merge over one iterator per layer, the memtable and each
@@ -109,9 +144,10 @@ Done, the durable write path over a memtable that now spills to disk:
 
 Not done yet:
 
-- **Leveled or tiered compaction.** Compaction here is a single full merge, not a
-  background, size-tiered one, so it does more work than it needs to and pauses
-  the writer while it runs.
+- **Background compaction.** Compaction is leveled now, so it does far less work
+  per run, but it still happens on the writer's thread and pauses it while it runs
+  rather than moving to a background thread. Level-0 tables also tend to span the
+  whole key range, so an L0-into-L1 merge still rewrites much of level 1.
 - **Block-level checksums and compression** inside an SSTable, and a block cache.
   A read seeks straight to bytes on disk with no cache and no per-block integrity
   check beyond the write-time fsync.

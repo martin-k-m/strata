@@ -310,6 +310,112 @@ class StrataStoreTest {
         }
     }
 
+    @Test
+    void formsMultipleLevelsAndMatchesTheModel(@TempDir Path dir) {
+        // A small flush threshold and a wide keyspace force many flushes, so level 0
+        // fills and merges down repeatedly until several levels exist. Correctness is
+        // checked against a TreeMap oracle once the levels have formed.
+        Random rng = new Random(99);
+        TreeMap<String, byte[]> oracle = new TreeMap<>();
+        int keyspace = 500;
+
+        try (StrataStore store = StrataStore.open(dir, 16)) {
+            for (int i = 0; i < 12_000; i++) {
+                String key = "key-" + String.format("%03d", rng.nextInt(keyspace));
+                if (rng.nextInt(10) < 8) {
+                    byte[] value = randomBytes(rng, 1 + rng.nextInt(40));
+                    store.put(k(key), value);
+                    oracle.put(key, value);
+                } else {
+                    store.delete(k(key));
+                    oracle.remove(key);
+                }
+            }
+
+            // Several levels below level 0 must have formed, not one flat pile.
+            assertTrue(store.deepestLevel() >= 3,
+                    "expected several levels, deepest was " + store.deepestLevel());
+
+            for (int n = 0; n < keyspace; n++) {
+                String key = "key-" + String.format("%03d", n);
+                var got = store.get(k(key));
+                if (oracle.containsKey(key)) {
+                    assertArrayEquals(oracle.get(key), got.orElseThrow(), key);
+                } else {
+                    assertTrue(got.isEmpty(), key + " should be absent");
+                }
+            }
+            assertEquals(oracle.size(), store.size());
+
+            // And a full scan across every level still equals the oracle in order.
+            List<String> want = new ArrayList<>(oracle.keySet());
+            assertEquals(want, scanKeys(store, null, null));
+            // A bounded scan crosses several levels too.
+            assertScanMatches(store, oracle, "key-100", "key-400");
+        }
+    }
+
+    @Test
+    void tombstonesAreHonoredAcrossLevels(@TempDir Path dir) {
+        // Write a key, push it down through the levels with unrelated traffic, then
+        // delete it and push the tombstone down as well. The delete must win over the
+        // value sitting in a deeper level, and must keep winning after a reopen.
+        try (StrataStore store = StrataStore.open(dir, 8)) {
+            store.put(k("target"), k("original"));
+            for (int i = 0; i < 400; i++) {
+                store.put(k("fill-" + String.format("%03d", i)), k("v" + i));
+            }
+            assertArrayEquals(k("original"), store.get(k("target")).orElseThrow());
+
+            store.delete(k("target"));
+            for (int i = 0; i < 400; i++) {
+                store.put(k("more-" + String.format("%03d", i)), k("w" + i));
+            }
+            store.compact(); // force the tombstone all the way down
+
+            assertTrue(store.get(k("target")).isEmpty(), "delete must shadow the deeper value");
+            assertTrue(scanKeys(store, null, null).stream().noneMatch(s -> s.equals("target")));
+        }
+        try (StrataStore store = StrataStore.open(dir, 8)) {
+            assertTrue(store.get(k("target")).isEmpty(), "the delete must survive a reopen");
+        }
+    }
+
+    @Test
+    void levelStructureSurvivesAReopen(@TempDir Path dir) {
+        TreeMap<String, byte[]> oracle = new TreeMap<>();
+        int[] counts;
+        int deepest;
+
+        try (StrataStore store = StrataStore.open(dir, 16)) {
+            Random rng = new Random(5);
+            for (int i = 0; i < 6_000; i++) {
+                String key = "key-" + String.format("%03d", rng.nextInt(400));
+                byte[] value = randomBytes(rng, 1 + rng.nextInt(20));
+                store.put(k(key), value);
+                oracle.put(key, value);
+            }
+            store.flush(); // drain the memtable so every live key sits in a table on disk
+
+            deepest = store.deepestLevel();
+            assertTrue(deepest >= 2, "expected several levels, deepest was " + deepest);
+            counts = new int[deepest + 1];
+            for (int l = 0; l <= deepest; l++) counts[l] = store.tableCount(l);
+        }
+
+        // A fresh open must rebuild the same levels from the file names alone.
+        try (StrataStore store = StrataStore.open(dir, 16)) {
+            assertEquals(deepest, store.deepestLevel(), "deepest level after reopen");
+            for (int l = 0; l <= deepest; l++) {
+                assertEquals(counts[l], store.tableCount(l), "table count at level " + l);
+            }
+            for (Map.Entry<String, byte[]> e : oracle.entrySet()) {
+                assertArrayEquals(e.getValue(), store.get(k(e.getKey())).orElseThrow(), e.getKey());
+            }
+            assertEquals(oracle.size(), store.size());
+        }
+    }
+
     /** Asserts a scan over {@code [from, to)} equals the oracle's own sub-range. */
     private static void assertScanMatches(StrataStore store, TreeMap<String, byte[]> oracle,
                                           String from, String to) {

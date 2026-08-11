@@ -103,9 +103,12 @@ final class SSTable {
     private final long[] indexOffsets;
     private final long dataLen;
     private final int entryCount;
+    private final Bytes firstKey;
+    private final Bytes lastKey;
 
     private SSTable(FileChannel channel, Path path, BloomFilter bloom,
-                    Bytes[] indexKeys, long[] indexOffsets, long dataLen, int entryCount) {
+                    Bytes[] indexKeys, long[] indexOffsets, long dataLen, int entryCount,
+                    Bytes firstKey, Bytes lastKey) {
         this.channel = channel;
         this.path = path;
         this.bloom = bloom;
@@ -113,6 +116,8 @@ final class SSTable {
         this.indexOffsets = indexOffsets;
         this.dataLen = dataLen;
         this.entryCount = entryCount;
+        this.firstKey = firstKey;
+        this.lastKey = lastKey;
     }
 
     /**
@@ -229,7 +234,15 @@ final class SSTable {
             for (int i = 0; i < words.length; i++) words[i] = bloomBuf.getLong();
             BloomFilter bloom = BloomFilter.load(numBits, numHashes, words);
 
-            return new SSTable(ch, path, bloom, indexKeys, indexOffsets, dataLen, entryCount);
+            // The first and last keys bound the table's range, which the levels use
+            // to keep runs disjoint and to test two tables for overlap. The first key
+            // is the first indexed key; the last is found by scanning forward from the
+            // last index entry, which is at most INDEX_INTERVAL entries away.
+            Bytes firstKey = (indexCount > 0) ? indexKeys[0] : null;
+            Bytes lastKey = (entryCount > 0) ? lastKeyFrom(ch, indexOffsets[indexCount - 1], dataLen) : null;
+
+            return new SSTable(ch, path, bloom, indexKeys, indexOffsets, dataLen, entryCount,
+                    firstKey, lastKey);
         } catch (IOException ex) {
             throw new UncheckedIOException("cannot open sstable " + path, ex);
         }
@@ -241,6 +254,42 @@ final class SSTable {
 
     int entryCount() {
         return entryCount;
+    }
+
+    /** The smallest key in the table, or null if it is empty. */
+    Bytes firstKey() {
+        return firstKey;
+    }
+
+    /** The largest key in the table, or null if it is empty. */
+    Bytes lastKey() {
+        return lastKey;
+    }
+
+    /** The length of the data block in bytes, a cheap proxy for the table's size. */
+    long dataLen() {
+        return dataLen;
+    }
+
+    /** Decodes keys forward from {@code start} to {@code end}, returning the last one. */
+    private static Bytes lastKeyFrom(FileChannel ch, long start, long end) throws IOException {
+        long pos = start;
+        Bytes last = null;
+        while (pos < end) {
+            ByteBuffer header = readAt(ch, pos, 4);
+            header.flip();
+            int keyLen = header.getInt();
+            ByteBuffer keyBuf = readAt(ch, pos + 4, keyLen);
+            keyBuf.flip();
+            byte[] key = new byte[keyLen];
+            keyBuf.get(key);
+            ByteBuffer valLenBuf = readAt(ch, pos + 4 + keyLen, 4);
+            valLenBuf.flip();
+            int valLen = valLenBuf.getInt();
+            last = Bytes.wrap(key);
+            pos += 4 + keyLen + 4 + Math.max(valLen, 0);
+        }
+        return last;
     }
 
     /**

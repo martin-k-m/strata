@@ -45,6 +45,30 @@ import java.util.stream.StreamSupport;
  * do not run concurrently with one another. Reads run alongside a writer without
  * locking, which is why a flush publishes the new table before it clears the
  * memtable, so a key is never briefly absent from both.
+ *
+ * <h2>Levels</h2>
+ *
+ * On-disk tables are organised into levels, which is what keeps a compaction from
+ * rewriting the whole store. A flush drops a table into level 0. Tables in level 0
+ * come straight from the memtable and may overlap each other in key range. Every
+ * level below is a <em>run</em>: its tables hold disjoint key ranges, so at most one
+ * table per level can hold a given key. For any key, a shallower level is newer than
+ * a deeper one, because a key only reaches level L+1 by being merged down out of
+ * level L, and the merge lets the shallower copy win.
+ *
+ * <p>Two triggers move data down. When level 0 reaches {@link #L0_COMPACTION_TRIGGER}
+ * tables it is merged into level 1. When a deeper level exceeds its table budget one
+ * of its tables is merged into the level below it, rewriting only the tables there
+ * that overlap it rather than the entire store. A merge keeps the newest value per
+ * key and drops a tombstone only when it is landing in the deepest populated level,
+ * where no older table can still hold the key it shadows.
+ *
+ * <p>This does less work per compaction than a single full merge, so it lowers write
+ * amplification, and it bounds read amplification to roughly one table per level plus
+ * the level-0 stack. It is an honest simplification of a real engine: level 0 tables
+ * usually span most of the key range, so an L0 into L1 merge still tends to rewrite
+ * much of level 1, and the store is still single-writer and still pauses the writer
+ * for the duration of a compaction rather than running it in the background.
  */
 public final class StrataStore implements Store {
 
@@ -58,8 +82,14 @@ public final class StrataStore implements Store {
     /** Default flush threshold: memtable entries before a spill to disk. */
     private static final int DEFAULT_FLUSH_THRESHOLD = 100_000;
 
-    /** SSTable count that triggers a full compaction after a flush. */
-    private static final int COMPACTION_TRIGGER = 4;
+    /** Level-0 table count that triggers a merge of level 0 into level 1. */
+    private static final int L0_COMPACTION_TRIGGER = 4;
+
+    /** Table budget of level 1. Each level below holds {@link #LEVEL_FANOUT} times more. */
+    private static final int LEVEL1_MAX_TABLES = 4;
+
+    /** How much larger each level's table budget is than the one above it. */
+    private static final int LEVEL_FANOUT = 4;
 
     private static final String SSTABLE_SUFFIX = ".sst";
     private static final String SSTABLE_PREFIX = "sst-";
@@ -68,15 +98,27 @@ public final class StrataStore implements Store {
     private final WriteAheadLog wal;
     private final int flushThreshold;
 
+    /**
+     * Target number of entries per on-disk table below level 0. A merged run is
+     * split into tables of about this many keys, so a level holds several tables that
+     * can be moved down one at a time. It tracks the flush threshold, so a level's
+     * tables are about the size of a flushed memtable.
+     */
+    private final int targetTableEntries;
+
     private volatile ConcurrentNavigableMap<Bytes, byte[]> memtable = new ConcurrentSkipListMap<>();
-    // Newest table first, so a lookup walks it front to back and the first hit wins.
-    private volatile List<SSTable> sstables = new ArrayList<>();
+    // Tables by level. levels.get(0) is level 0, newest table first. Each deeper level
+    // is a run whose tables are sorted by key and hold disjoint ranges. The whole
+    // structure is replaced, never mutated in place, so a lockless reader sees a
+    // consistent snapshot.
+    private volatile List<List<SSTable>> levels = new ArrayList<>();
     private long nextSeq;
 
     private StrataStore(Path dir, WriteAheadLog wal, int flushThreshold) {
         this.dir = dir;
         this.wal = wal;
         this.flushThreshold = flushThreshold;
+        this.targetTableEntries = Math.max(1, flushThreshold);
     }
 
     /** Opens a store at {@code dir} with the default flush threshold. */
@@ -132,7 +174,7 @@ public final class StrataStore implements Store {
         // before clearing the memtable, so a key is present in at least one of the
         // two references we read here.
         ConcurrentNavigableMap<Bytes, byte[]> mem = memtable;
-        List<SSTable> tables = sstables;
+        List<SSTable> tables = readOrder(levels);
 
         byte[] fromMem = mem.get(Bytes.wrap(key));
         if (fromMem != null) {
@@ -163,7 +205,7 @@ public final class StrataStore implements Store {
         // Snapshot the layers the way get() does: a concurrent flush publishes its
         // table before clearing the memtable, so no live key falls between the two.
         ConcurrentNavigableMap<Bytes, byte[]> mem = memtable;
-        List<SSTable> tables = sstables;
+        List<SSTable> tables = readOrder(levels);
 
         // A reversed or empty range has nothing in it, and the memtable's subMap
         // would reject a reversed one, so answer it directly.
@@ -237,7 +279,7 @@ public final class StrataStore implements Store {
         // The number of live keys across every layer. This scans all tables, so it
         // is not cheap; it exists for tests and introspection, not the hot path.
         ConcurrentNavigableMap<Bytes, byte[]> mem = memtable;
-        List<SSTable> tables = sstables;
+        List<SSTable> tables = readOrder(levels);
 
         TreeMap<Bytes, Boolean> live = new TreeMap<>();
         // Oldest first so newer layers overwrite older ones for the same key.
@@ -268,63 +310,103 @@ public final class StrataStore implements Store {
             entries.add(new AbstractMap.SimpleImmutableEntry<>(e.getKey(), value));
         }
 
-        Path path = dir.resolve(sstableName(nextSeq));
+        Path path = dir.resolve(sstableName(0, nextSeq));
         SSTable.write(path, entries); // fsynced and atomically renamed before it is opened
         SSTable table = SSTable.open(path);
-
-        // Publish the table before clearing the memtable, so a concurrent reader
-        // always finds each key in one place or the other.
-        List<SSTable> updated = new ArrayList<>(sstables.size() + 1);
-        updated.add(table);
-        updated.addAll(sstables);
-        sstables = updated;
-        memtable = new ConcurrentSkipListMap<>();
         nextSeq++;
+
+        // Publish the table into level 0 before clearing the memtable, so a concurrent
+        // reader always finds each key in one place or the other. Newest first.
+        List<List<SSTable>> updated = copyLevels(levels);
+        updated.get(0).add(0, table);
+        levels = updated;
+        memtable = new ConcurrentSkipListMap<>();
 
         // The memtable's writes now live in the durable table, so the log records
         // that carried them are redundant and can be dropped.
         wal.reset();
 
-        if (sstables.size() >= COMPACTION_TRIGGER) compact();
+        maybeCompact();
     }
 
     /**
-     * Merges every SSTable into one, keeping only the newest value for each key
-     * and dropping tombstones. Dropping a tombstone is safe only here, in a full
-     * merge: once no older table survives, there is nothing left for the tombstone
-     * to shadow, so the delete is complete and the marker is pure overhead.
-     *
-     * A no-op below two tables, where there is nothing to merge.
+     * Runs compaction to completion, then forces level 0 empty by merging it down
+     * even if it has not reached the trigger. It leaves a valid leveled layout, not
+     * a single table. Exposed mainly so tests can drain pending work at a chosen
+     * point; normally {@link #maybeCompact()} drives it off the level triggers.
      */
     public synchronized void compact() {
-        List<SSTable> tables = sstables;
-        if (tables.size() < 2) return;
-
-        // Merge newest to oldest into a sorted map; the first write for a key wins,
-        // so iterate newest first and only fill a key that is not already set.
-        TreeMap<Bytes, byte[]> merged = new TreeMap<>();
-        java.util.Set<Bytes> seen = new java.util.HashSet<>();
-        for (SSTable table : tables) { // newest to oldest
-            SSTable.Iterator it = table.scan();
-            while (it.hasNext()) {
-                SSTable.Entry e = it.next();
-                if (!seen.add(e.key())) continue; // a newer table already decided this key
-                if (!e.tombstone()) merged.put(e.key(), e.value());
-            }
+        while (compactionStep(true)) {
+            // keep going until level 0 is empty and no level is over its budget
         }
+    }
 
-        List<Map.Entry<Bytes, byte[]>> entries = new ArrayList<>(merged.entrySet());
-        Path path = dir.resolve(sstableName(nextSeq));
-        SSTable.write(path, entries);
-        SSTable compacted = SSTable.open(path);
-        nextSeq++;
+    /** Runs any compaction the level triggers call for, then stops. */
+    private void maybeCompact() {
+        while (compactionStep(false)) {
+            // one step per iteration until nothing is over its trigger
+        }
+    }
 
-        List<SSTable> updated = new ArrayList<>();
-        updated.add(compacted);
-        sstables = updated;
+    /**
+     * Performs one compaction if a level calls for it and returns whether it did.
+     *
+     * <p>Level 0 is merged into level 1 when it reaches {@link #L0_COMPACTION_TRIGGER}
+     * tables, or unconditionally when {@code forceL0} is set and it is not empty.
+     * Otherwise the shallowest level that is over its table budget has one table
+     * merged into the level below it. Either way the inputs are the source tables
+     * plus the tables in the target level that overlap their key range, and the
+     * output is a fresh disjoint run split into tables of about
+     * {@link #targetTableEntries} keys.
+     */
+    private boolean compactionStep(boolean forceL0) {
+        List<List<SSTable>> snapshot = levels;
+        if (snapshot.isEmpty()) return false;
+        List<SSTable> level0 = snapshot.get(0);
 
-        // The merged inputs are unreferenced now; close and remove their files.
-        for (SSTable old : tables) {
+        int target;
+        List<SSTable> sources = new ArrayList<>(); // newest first
+        List<SSTable> targetOverlap;
+
+        if (level0.size() >= L0_COMPACTION_TRIGGER || (forceL0 && !level0.isEmpty())) {
+            target = 1;
+            sources.addAll(level0); // already newest first
+            targetOverlap = overlapping(levelAt(snapshot, target), keyRange(level0));
+        } else {
+            int over = shallowestOverBudget(snapshot);
+            if (over < 0) return false;
+            target = over + 1;
+            // Pick the table with the smallest first key, a stable, simple choice.
+            SSTable picked = smallestFirstKey(snapshot.get(over));
+            sources.add(picked);
+            targetOverlap = overlapping(levelAt(snapshot, target), keyRange(List.of(picked)));
+        }
+        sources.addAll(targetOverlap); // older than every source above
+
+        // A tombstone can be discarded only when it is landing in the deepest level
+        // that still holds data, where nothing older survives for it to shadow.
+        boolean dropTombstones = isDeepestPopulated(snapshot, target);
+
+        List<Map.Entry<Bytes, byte[]>> merged = mergeSources(sources, dropTombstones);
+        List<SSTable> output = writeRun(merged, target);
+
+        // Build the new level structure: drop the consumed tables, add the output run.
+        List<List<SSTable>> updated = copyLevels(snapshot);
+        while (updated.size() <= target) updated.add(new ArrayList<>());
+        if (target == 1) {
+            updated.get(0).clear(); // the whole of level 0 was merged down
+        } else {
+            updated.get(target - 1).remove(sources.get(0)); // the single picked table
+        }
+        List<SSTable> newTarget = updated.get(target);
+        newTarget.removeAll(targetOverlap);
+        newTarget.addAll(output);
+        newTarget.sort(java.util.Comparator.comparing(SSTable::firstKey));
+        levels = updated;
+
+        // The consumed inputs are unreferenced now; close and remove their files.
+        List<SSTable> consumed = new ArrayList<>(sources);
+        for (SSTable old : consumed) {
             old.close();
             try {
                 Files.deleteIfExists(old.path());
@@ -332,50 +414,221 @@ public final class StrataStore implements Store {
                 throw new UncheckedIOException("cannot remove compacted sstable " + old.path(), e);
             }
         }
+        return true;
+    }
+
+    /**
+     * Merges {@code sources} (newest first, each in key order) into one sorted run,
+     * keeping the newest record per key. A dropped tombstone leaves no entry; a kept
+     * one is written with a null value so it still shadows deeper levels.
+     */
+    private static List<Map.Entry<Bytes, byte[]>> mergeSources(
+            List<SSTable> sources, boolean dropTombstones) {
+        TreeMap<Bytes, byte[]> merged = new TreeMap<>();
+        java.util.Set<Bytes> seen = new java.util.HashSet<>();
+        for (SSTable table : sources) { // newest to oldest
+            SSTable.Iterator it = table.scan();
+            while (it.hasNext()) {
+                SSTable.Entry e = it.next();
+                if (!seen.add(e.key())) continue; // a newer source already decided this key
+                if (e.tombstone()) {
+                    if (!dropTombstones) merged.put(e.key(), null);
+                } else {
+                    merged.put(e.key(), e.value());
+                }
+            }
+        }
+        return new ArrayList<>(merged.entrySet());
+    }
+
+    /** Writes {@code entries} to level {@code target} as tables of about the target size. */
+    private List<SSTable> writeRun(List<Map.Entry<Bytes, byte[]>> entries, int target) {
+        List<SSTable> out = new ArrayList<>();
+        for (int i = 0; i < entries.size(); i += targetTableEntries) {
+            List<Map.Entry<Bytes, byte[]>> chunk =
+                    entries.subList(i, Math.min(i + targetTableEntries, entries.size()));
+            Path path = dir.resolve(sstableName(target, nextSeq));
+            SSTable.write(path, chunk);
+            out.add(SSTable.open(path));
+            nextSeq++;
+        }
+        return out;
     }
 
     @Override
     public synchronized void close() {
         wal.close();
-        for (SSTable table : sstables) table.close();
+        for (List<SSTable> level : levels) {
+            for (SSTable table : level) table.close();
+        }
+    }
+
+    /** The number of levels that currently hold at least one table. For tests. */
+    synchronized int populatedLevelCount() {
+        int count = 0;
+        for (List<SSTable> level : levels) {
+            if (!level.isEmpty()) count++;
+        }
+        return count;
+    }
+
+    /** The number of tables in {@code level}, zero past the deepest one. For tests. */
+    synchronized int tableCount(int level) {
+        List<List<SSTable>> snapshot = levels;
+        return (level < snapshot.size()) ? snapshot.get(level).size() : 0;
+    }
+
+    /** The index of the deepest level that holds a table, or -1 if the store is empty. For tests. */
+    synchronized int deepestLevel() {
+        List<List<SSTable>> snapshot = levels;
+        for (int i = snapshot.size() - 1; i >= 0; i--) {
+            if (!snapshot.get(i).isEmpty()) return i;
+        }
+        return -1;
+    }
+
+    /** Flattens the levels into read priority order: level 0 newest first, then deeper levels. */
+    private static List<SSTable> readOrder(List<List<SSTable>> levels) {
+        List<SSTable> out = new ArrayList<>();
+        for (List<SSTable> level : levels) out.addAll(level);
+        return out;
+    }
+
+    private static List<List<SSTable>> copyLevels(List<List<SSTable>> levels) {
+        List<List<SSTable>> copy = new ArrayList<>(levels.size() + 1);
+        for (List<SSTable> level : levels) copy.add(new ArrayList<>(level));
+        if (copy.isEmpty()) copy.add(new ArrayList<>()); // always keep level 0 present
+        return copy;
+    }
+
+    /** The tables at {@code level}, growing the structure with empty levels as needed. */
+    private static List<SSTable> levelAt(List<List<SSTable>> levels, int level) {
+        return (level < levels.size()) ? levels.get(level) : List.of();
+    }
+
+    /** The maximum table count a level may hold before it spills one table downward. */
+    private static int levelMaxTables(int level) {
+        // Level 0 is governed by the count trigger, not a budget. Deeper levels grow
+        // geometrically, which is what bounds the number of levels for a given data
+        // size and so bounds read amplification.
+        int max = LEVEL1_MAX_TABLES;
+        for (int i = 1; i < level; i++) max *= LEVEL_FANOUT;
+        return max;
+    }
+
+    /** The shallowest level at or below 1 that is over its table budget, or -1 if none is. */
+    private static int shallowestOverBudget(List<List<SSTable>> levels) {
+        for (int level = 1; level < levels.size(); level++) {
+            if (levels.get(level).size() > levelMaxTables(level)) return level;
+        }
+        return -1;
+    }
+
+    /** True if no level deeper than {@code target} holds a table. */
+    private static boolean isDeepestPopulated(List<List<SSTable>> levels, int target) {
+        for (int level = target + 1; level < levels.size(); level++) {
+            if (!levels.get(level).isEmpty()) return false;
+        }
+        return true;
+    }
+
+    /** The [min first key, max last key] spanned by {@code tables}, or null if empty. */
+    private static Bytes[] keyRange(List<SSTable> tables) {
+        Bytes min = null, max = null;
+        for (SSTable t : tables) {
+            if (t.firstKey() == null) continue;
+            if (min == null || t.firstKey().compareTo(min) < 0) min = t.firstKey();
+            if (max == null || t.lastKey().compareTo(max) > 0) max = t.lastKey();
+        }
+        return (min == null) ? null : new Bytes[] {min, max};
+    }
+
+    /** The tables in {@code level} whose range intersects {@code range}. */
+    private static List<SSTable> overlapping(List<SSTable> level, Bytes[] range) {
+        List<SSTable> out = new ArrayList<>();
+        if (range == null) return out;
+        for (SSTable t : level) {
+            if (t.firstKey() == null) continue;
+            // Two ranges overlap when neither lies entirely to one side of the other.
+            if (t.firstKey().compareTo(range[1]) <= 0 && range[0].compareTo(t.lastKey()) <= 0) {
+                out.add(t);
+            }
+        }
+        return out;
+    }
+
+    private static SSTable smallestFirstKey(List<SSTable> level) {
+        SSTable best = null;
+        for (SSTable t : level) {
+            if (best == null || t.firstKey().compareTo(best.firstKey()) < 0) best = t;
+        }
+        return best;
     }
 
     private void maybeFlush() {
         if (memtable.size() >= flushThreshold) flush();
     }
 
-    /** Loads existing tables at open, ordering them newest (highest sequence) first. */
+    /**
+     * Loads existing tables at open, reconstructing the levels from the level and
+     * sequence encoded in each file name. The level and the sequence are the whole
+     * manifest: no separate file is needed, because the name carries both which level
+     * a table sits in and, through its sequence, which of two level-0 tables is newer.
+     */
     private void loadSSTables() {
         List<Path> paths = new ArrayList<>();
         try (Stream<Path> files = Files.list(dir)) {
-            files.filter(p -> {
-                String n = p.getFileName().toString();
-                return n.startsWith(SSTABLE_PREFIX) && n.endsWith(SSTABLE_SUFFIX);
-            }).forEach(paths::add);
+            files.filter(p -> parseName(p.getFileName().toString()) != null).forEach(paths::add);
         } catch (IOException e) {
             throw new UncheckedIOException("cannot list store directory " + dir, e);
         }
-        // Zero-padded names sort lexicographically the same as by sequence number.
-        paths.sort(java.util.Comparator.comparing(p -> p.getFileName().toString()));
 
-        List<SSTable> loaded = new ArrayList<>();
+        List<List<SSTable>> loaded = new ArrayList<>();
+        loaded.add(new ArrayList<>()); // level 0 always present
         long maxSeq = -1;
         for (Path p : paths) {
-            SSTable table = SSTable.open(p);
-            loaded.add(0, table); // prepend so the newest ends up first
-            maxSeq = Math.max(maxSeq, sequenceOf(p));
+            long[] parsed = parseName(p.getFileName().toString());
+            int level = (int) parsed[0];
+            long seq = parsed[1];
+            while (loaded.size() <= level) loaded.add(new ArrayList<>());
+            loaded.get(level).add(SSTable.open(p));
+            maxSeq = Math.max(maxSeq, seq);
         }
-        sstables = loaded;
+
+        // Level 0 is newest first (highest sequence first); each deeper level is a run
+        // ordered by key. Both orderings are what the read and merge paths assume.
+        loaded.get(0).sort(java.util.Comparator.comparingLong(this::sequenceOf).reversed());
+        for (int level = 1; level < loaded.size(); level++) {
+            loaded.get(level).sort(java.util.Comparator.comparing(SSTable::firstKey));
+        }
+
+        levels = loaded;
         nextSeq = maxSeq + 1;
     }
 
-    private static String sstableName(long seq) {
-        return String.format("%s%010d%s", SSTABLE_PREFIX, seq, SSTABLE_SUFFIX);
+    private long sequenceOf(SSTable table) {
+        return parseName(table.path().getFileName().toString())[1];
     }
 
-    private static long sequenceOf(Path path) {
-        String n = path.getFileName().toString();
-        String digits = n.substring(SSTABLE_PREFIX.length(), n.length() - SSTABLE_SUFFIX.length());
-        return Long.parseLong(digits);
+    private static String sstableName(int level, long seq) {
+        return String.format("%s%02d-%010d%s", SSTABLE_PREFIX, level, seq, SSTABLE_SUFFIX);
+    }
+
+    /**
+     * Parses {@code sst-<level>-<seq>.sst} into {@code [level, seq]}, or null if the
+     * name is not a strata table name.
+     */
+    private static long[] parseName(String name) {
+        if (!name.startsWith(SSTABLE_PREFIX) || !name.endsWith(SSTABLE_SUFFIX)) return null;
+        String middle = name.substring(SSTABLE_PREFIX.length(), name.length() - SSTABLE_SUFFIX.length());
+        int dash = middle.indexOf('-');
+        if (dash < 0) return null;
+        try {
+            long level = Long.parseLong(middle.substring(0, dash));
+            long seq = Long.parseLong(middle.substring(dash + 1));
+            return new long[] {level, seq};
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 }

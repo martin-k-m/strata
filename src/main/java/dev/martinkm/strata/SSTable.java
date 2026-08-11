@@ -293,39 +293,85 @@ final class SSTable {
      * position in the shared channel, so it is single-threaded by construction.
      */
     Iterator scan() {
-        return new Iterator();
+        return new Iterator(0, null, null);
+    }
+
+    /**
+     * A reader over entries with key in {@code [from, to)} in key order, tombstones
+     * included. A {@code null} bound is open on that side. The sparse index seeks
+     * close to {@code from} so a bounded scan does not read the whole table.
+     */
+    Iterator scan(byte[] from, byte[] to) {
+        long start = (from == null) ? 0 : floorOffset(Bytes.wrap(from));
+        return new Iterator(start, from, to);
     }
 
     final class Iterator {
-        private long pos = 0;
+        private long pos;
+        private final Bytes from;
+        private final Bytes to;
+        private Entry buffered;
+
+        Iterator(long startPos, byte[] from, byte[] to) {
+            this.pos = startPos;
+            this.from = (from == null) ? null : Bytes.wrap(from);
+            this.to = (to == null) ? null : Bytes.wrap(to);
+            buffered = readNextInRange();
+        }
 
         boolean hasNext() {
-            return pos < dataLen;
+            return buffered != null;
         }
 
         Entry next() {
-            if (pos >= dataLen) throw new NoSuchElementException();
+            if (buffered == null) throw new NoSuchElementException();
+            Entry e = buffered;
+            buffered = readNextInRange();
+            return e;
+        }
+
+        /**
+         * Decodes forward from {@code pos} to the next entry whose key falls in
+         * range, or null past the end. The floor offset can land before {@code from},
+         * so entries below it are skipped; the first key at or above {@code to} ends
+         * the scan.
+         */
+        private Entry readNextInRange() {
             try {
-                ByteBuffer header = readAt(channel, pos, 4);
-                header.flip();
-                int keyLen = header.getInt();
-                ByteBuffer keyBuf = readAt(channel, pos + 4, keyLen);
-                keyBuf.flip();
-                byte[] key = new byte[keyLen];
-                keyBuf.get(key);
-                ByteBuffer valLenBuf = readAt(channel, pos + 4 + keyLen, 4);
-                valLenBuf.flip();
-                int valLen = valLenBuf.getInt();
-                if (valLen == TOMBSTONE_LEN) {
-                    pos += 4 + keyLen + 4;
-                    return new Entry(Bytes.wrap(key), null, true);
+                while (pos < dataLen) {
+                    ByteBuffer header = readAt(channel, pos, 4);
+                    header.flip();
+                    int keyLen = header.getInt();
+                    ByteBuffer keyBuf = readAt(channel, pos + 4, keyLen);
+                    keyBuf.flip();
+                    byte[] key = new byte[keyLen];
+                    keyBuf.get(key);
+                    ByteBuffer valLenBuf = readAt(channel, pos + 4 + keyLen, 4);
+                    valLenBuf.flip();
+                    int valLen = valLenBuf.getInt();
+
+                    Entry entry;
+                    if (valLen == TOMBSTONE_LEN) {
+                        pos += 4 + keyLen + 4;
+                        entry = new Entry(Bytes.wrap(key), null, true);
+                    } else {
+                        ByteBuffer valBuf = readAt(channel, pos + 4 + keyLen + 4, valLen);
+                        valBuf.flip();
+                        byte[] value = new byte[valLen];
+                        valBuf.get(value);
+                        pos += 4 + keyLen + 4 + valLen;
+                        entry = new Entry(Bytes.wrap(key), value, false);
+                    }
+
+                    Bytes k = entry.key();
+                    if (from != null && k.compareTo(from) < 0) continue; // floor landed early
+                    if (to != null && k.compareTo(to) >= 0) {            // past the range
+                        pos = dataLen;
+                        return null;
+                    }
+                    return entry;
                 }
-                ByteBuffer valBuf = readAt(channel, pos + 4 + keyLen + 4, valLen);
-                valBuf.flip();
-                byte[] value = new byte[valLen];
-                valBuf.get(value);
-                pos += 4 + keyLen + 4 + valLen;
-                return new Entry(Bytes.wrap(key), value, false);
+                return null;
             } catch (IOException ex) {
                 throw new UncheckedIOException("sstable scan failed " + path, ex);
             }

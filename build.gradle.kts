@@ -27,3 +27,12 @@ tasks.test {
         events("passed", "skipped", "failed")
     }
 }
+
+// Runs the throughput harness: gradle bench, or -Pbench.n=200000 to size it.
+tasks.register<JavaExec>("bench") {
+    group = "application"
+    description = "Runs the strata throughput benchmark."
+    mainClass = "dev.martinkm.strata.Benchmark"
+    classpath = sourceSets["main"].runtimeClasspath
+    (project.findProperty("bench.n") as String?)?.let { args = listOf(it) }
+}

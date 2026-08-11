@@ -9,14 +9,18 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.AbstractMap;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Spliterator;
+import java.util.Spliterators;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentNavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
 
 /**
  * A durable, ordered key-value store: the write path over a memtable that spills
@@ -152,6 +156,80 @@ public final class StrataStore implements Store {
         // shadow any older on-disk value for the same key.
         memtable.put(Bytes.copyOf(key), TOMBSTONE);
         maybeFlush();
+    }
+
+    @Override
+    public Stream<Map.Entry<byte[], byte[]>> scan(byte[] from, byte[] to) {
+        // Snapshot the layers the way get() does: a concurrent flush publishes its
+        // table before clearing the memtable, so no live key falls between the two.
+        ConcurrentNavigableMap<Bytes, byte[]> mem = memtable;
+        List<SSTable> tables = sstables;
+
+        // A reversed or empty range has nothing in it, and the memtable's subMap
+        // would reject a reversed one, so answer it directly.
+        if (from != null && to != null && Bytes.wrap(from).compareTo(Bytes.wrap(to)) >= 0) {
+            return Stream.empty();
+        }
+
+        // One source per layer, newest first: the memtable, then the SSTables newest
+        // to oldest. Each yields cells in key order, which is what the merge needs.
+        List<Iterator<MergingIterator.Cell>> sources = new ArrayList<>(tables.size() + 1);
+        sources.add(memtableSource(mem, from, to));
+        for (SSTable table : tables) { // newest to oldest
+            sources.add(sstableSource(table.scan(from, to)));
+        }
+
+        MergingIterator merged = new MergingIterator(sources);
+        Spliterator<MergingIterator.Cell> spliterator = Spliterators.spliteratorUnknownSize(
+                merged, Spliterator.ORDERED | Spliterator.NONNULL);
+        return StreamSupport.stream(spliterator, false)
+                .map(cell -> new AbstractMap.SimpleImmutableEntry<byte[], byte[]>(
+                        cell.key().toArray(), cell.value().clone()));
+    }
+
+    /** The memtable rows in {@code [from, to)} as merge cells, tombstones marked. */
+    private Iterator<MergingIterator.Cell> memtableSource(
+            ConcurrentNavigableMap<Bytes, byte[]> mem, byte[] from, byte[] to) {
+        ConcurrentNavigableMap<Bytes, byte[]> range;
+        if (from == null && to == null) {
+            range = mem;
+        } else if (from == null) {
+            range = mem.headMap(Bytes.wrap(to), false);
+        } else if (to == null) {
+            range = mem.tailMap(Bytes.wrap(from), true);
+        } else {
+            range = mem.subMap(Bytes.wrap(from), true, Bytes.wrap(to), false);
+        }
+        Iterator<Map.Entry<Bytes, byte[]>> it = range.entrySet().iterator();
+        return new Iterator<>() {
+            @Override
+            public boolean hasNext() {
+                return it.hasNext();
+            }
+
+            @Override
+            public MergingIterator.Cell next() {
+                Map.Entry<Bytes, byte[]> e = it.next();
+                boolean tombstone = e.getValue() == TOMBSTONE;
+                return new MergingIterator.Cell(e.getKey(), tombstone ? null : e.getValue(), tombstone);
+            }
+        };
+    }
+
+    /** Adapts an {@link SSTable.Iterator} to the merge's cell iterator. */
+    private static Iterator<MergingIterator.Cell> sstableSource(SSTable.Iterator it) {
+        return new Iterator<>() {
+            @Override
+            public boolean hasNext() {
+                return it.hasNext();
+            }
+
+            @Override
+            public MergingIterator.Cell next() {
+                SSTable.Entry e = it.next();
+                return new MergingIterator.Cell(e.key(), e.value(), e.tombstone());
+            }
+        };
     }
 
     @Override

@@ -68,6 +68,16 @@ With a local JDK 21 and Gradle:
 gradle test
 ```
 
+There is also a small throughput harness. It fills a store with N random keys and
+prints puts, gets that hit, gets that miss and full scans as operations per second.
+It is a timed loop, not JMH, so the numbers are rough magnitudes. Note that every
+put fsyncs the log, so the put rate is bound by the disk, not the code.
+
+```bash
+gradle bench                 # N defaults to 100000
+gradle bench -Pbench.n=200000
+```
+
 The tests are the interesting part. Beyond the round trips, `strata` is checked
 against an in-memory `TreeMap` oracle over thousands of random operations, once
 purely in memory and once with a flush threshold small enough that tables spill
@@ -90,6 +100,12 @@ Done, the durable write path over a memtable that now spills to disk:
   it in the table that can. Tombstones shadow older values across the boundary.
 - **Compaction.** A full merge of every SSTable into one that keeps the newest
   value per key and discards tombstones once no older table survives them.
+- **Ordered scans.** `scan(from, to)` returns the live pairs with key in
+  `[from, to)` in ascending key order, `null` on either bound meaning open on that
+  side. It is a k-way merge over one iterator per layer, the memtable and each
+  SSTable, so it keeps the newest value per key, drops tombstoned keys and holds
+  one entry per layer at a time rather than the whole store. A reversed or empty
+  range returns nothing.
 
 Not done yet:
 
@@ -99,8 +115,6 @@ Not done yet:
 - **Block-level checksums and compression** inside an SSTable, and a block cache.
   A read seeks straight to bytes on disk with no cache and no per-block integrity
   check beyond the write-time fsync.
-- **Ordered scans** across the layers, which the sorted tables make cheap but
-  which the `Store` interface does not yet expose.
 
 The `Store` interface above these does not change as they land.
 

@@ -23,8 +23,8 @@ import java.util.zip.CRC32;
  *                    \___ over the payload ___/     valLen = -1 marks a delete
  * </pre>
  *
- * A crash can only ever tear the <em>last</em> record — the process dies
- * mid-append — so recovery reads until a record is short or fails its CRC, then
+ * A crash can only ever tear the <em>last</em> record, because the process dies
+ * mid-append, so recovery reads until a record is short or fails its CRC, then
  * truncates the file to the last whole record. That is the difference between a
  * log that recovers and one that refuses to open after a hard kill.
  */

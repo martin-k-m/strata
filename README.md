@@ -3,12 +3,12 @@
 A log-structured key-value store in Java, built from the write path up.
 
 `strata` is an [LSM-tree](https://en.wikipedia.org/wiki/Log-structured_merge-tree)
-storage engine — the shape of RocksDB, LevelDB and the write path under most of
+storage engine, the shape of RocksDB, LevelDB and the write path under most of
 the databases you have used. It is written to be read: a small, dependency-free
 core where every durability and ordering decision is visible rather than buried
 in a framework.
 
-The name is the data structure. An LSM tree keeps data in sorted **layers** —
+The name is the data structure. An LSM tree keeps data in sorted **layers**:
 a mutable one in memory over a stack of immutable ones on disk, and answers a
 read by looking down through the strata until it finds the key.
 
@@ -17,7 +17,7 @@ read by looking down through the strata until it finds the key.
 - **Durability.** Every `put` and `delete` is appended to a write-ahead log and
   `fsync`ed before the call returns. A write that returned has survived; a crash
   can lose only writes still in flight.
-- **Crash recovery.** A process killed at any instant — including mid-append —
+- **Crash recovery.** A process killed at any instant, including mid-append,
   reopens to a consistent state. Recovery replays the log and truncates a torn
   trailing record, so a hard kill never leaves a store that refuses to open.
 - **Ordering.** Keys are held in unsigned-lexicographic order, the same order
@@ -56,7 +56,7 @@ finally discard them.
 
 ## Build and test
 
-No JDK on your machine needed — it builds in a container:
+No JDK on your machine needed. It builds in a container:
 
 ```bash
 docker run --rm -v "$PWD":/app -w /app gradle:8.10-jdk21 gradle test

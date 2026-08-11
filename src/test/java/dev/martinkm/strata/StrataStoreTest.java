@@ -126,6 +126,112 @@ class StrataStoreTest {
         }
     }
 
+    @Test
+    void matchesTheModelWhileFlushingMidRun(@TempDir Path dir) {
+        // A tiny flush threshold forces many spills to SSTables during the run, so
+        // reads exercise the memtable, the bloom filter, the sparse index and
+        // several stacked tables rather than the memtable alone.
+        Random rng = new Random(7);
+        TreeMap<String, byte[]> oracle = new TreeMap<>();
+        int keyspace = 300;
+
+        try (StrataStore store = StrataStore.open(dir, 32)) {
+            for (int i = 0; i < 8_000; i++) {
+                String key = "key-" + rng.nextInt(keyspace);
+                if (rng.nextInt(10) < 7) {
+                    byte[] value = randomBytes(rng, 1 + rng.nextInt(40));
+                    store.put(k(key), value);
+                    oracle.put(key, value);
+                } else {
+                    store.delete(k(key));
+                    oracle.remove(key);
+                }
+            }
+
+            for (int n = 0; n < keyspace; n++) {
+                String key = "key-" + n;
+                var got = store.get(k(key));
+                if (oracle.containsKey(key)) {
+                    assertArrayEquals(oracle.get(key), got.orElseThrow(), key);
+                } else {
+                    assertTrue(got.isEmpty(), key + " should be absent");
+                }
+            }
+            assertEquals(oracle.size(), store.size());
+        }
+    }
+
+    @Test
+    void tombstoneInMemtableShadowsAnOlderSSTableValue(@TempDir Path dir) {
+        // A threshold of one flushes after every write, so each mutation lands in
+        // its own SSTable and the delete below is a tombstone that must beat the
+        // value already sitting in an older table for the same key.
+        try (StrataStore store = StrataStore.open(dir, 1)) {
+            store.put(k("gone"), k("value")); // flushes to an SSTable
+            store.put(k("stays"), k("keep")); // flushes to a newer SSTable
+            store.delete(k("gone"));          // tombstone, in a newer table still
+
+            assertTrue(store.get(k("gone")).isEmpty(), "delete must shadow the older on-disk value");
+            assertArrayEquals(k("keep"), store.get(k("stays")).orElseThrow());
+            assertEquals(1, store.size());
+        }
+        // And the shadowing survives a reopen that rebuilds purely from disk.
+        try (StrataStore store = StrataStore.open(dir, 1)) {
+            assertTrue(store.get(k("gone")).isEmpty());
+            assertArrayEquals(k("keep"), store.get(k("stays")).orElseThrow());
+            assertEquals(1, store.size());
+        }
+    }
+
+    @Test
+    void recoversFromSSTablesPlusWalTogether(@TempDir Path dir) {
+        // Force some data down to SSTables, then leave a tail of writes only in the
+        // memtable and log. A reopen must reconstruct both layers and merge them.
+        try (StrataStore store = StrataStore.open(dir, 4)) {
+            store.put(k("a"), k("1"));
+            store.put(k("b"), k("2"));
+            store.put(k("c"), k("3"));
+            store.put(k("d"), k("4")); // fourth write trips the flush, draining to an SSTable
+            // These stay in the fresh memtable and the rolled log, not yet flushed.
+            store.put(k("e"), k("5"));
+            store.delete(k("b"));
+        }
+        try (StrataStore store = StrataStore.open(dir, 4)) {
+            assertArrayEquals(k("1"), store.get(k("a")).orElseThrow()); // from the SSTable
+            assertTrue(store.get(k("b")).isEmpty());                    // tombstone replayed from the log
+            assertArrayEquals(k("3"), store.get(k("c")).orElseThrow());
+            assertArrayEquals(k("4"), store.get(k("d")).orElseThrow());
+            assertArrayEquals(k("5"), store.get(k("e")).orElseThrow()); // from the log
+            assertEquals(4, store.size());
+        }
+    }
+
+    @Test
+    void compactionMergesTablesAndDropsDeletedKeys(@TempDir Path dir) {
+        // With a threshold of one and the compaction trigger at four tables, enough
+        // writes here force at least one compaction. The observable state must not
+        // change: overwrites keep their newest value, deletes stay gone.
+        try (StrataStore store = StrataStore.open(dir, 1)) {
+            for (int i = 0; i < 10; i++) {
+                store.put(k("k" + i), k("v" + i));
+            }
+            store.put(k("k3"), k("v3-prime")); // overwrite
+            store.delete(k("k7"));             // delete
+            store.compact();                   // fold everything into one table
+
+            assertArrayEquals(k("v0"), store.get(k("k0")).orElseThrow());
+            assertArrayEquals(k("v3-prime"), store.get(k("k3")).orElseThrow());
+            assertTrue(store.get(k("k7")).isEmpty());
+            assertEquals(9, store.size());
+        }
+        // The merged result is a normal table set, so a reopen sees the same thing.
+        try (StrataStore store = StrataStore.open(dir, 1)) {
+            assertArrayEquals(k("v3-prime"), store.get(k("k3")).orElseThrow());
+            assertTrue(store.get(k("k7")).isEmpty());
+            assertEquals(9, store.size());
+        }
+    }
+
     private static byte[] randomBytes(Random rng, int len) {
         byte[] b = new byte[len];
         rng.nextBytes(b);

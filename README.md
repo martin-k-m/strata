@@ -9,7 +9,7 @@ core where every durability and ordering decision is visible rather than buried
 in a framework.
 
 The name is the data structure. An LSM tree keeps data in sorted **layers** —
-a mutable one in memory over a stack of immutable ones on disk — and answers a
+a mutable one in memory over a stack of immutable ones on disk, and answers a
 read by looking down through the strata until it finds the key.
 
 ## What it guarantees
@@ -32,13 +32,27 @@ put(k, v)
    ├─ 2. fsync the log                                ── the write is now durable
    └─ 3. apply to the memtable                        ── a lock-free sorted map
 
-get(k)  ── answer from the memtable
+get(k)  ── memtable, then SSTables newest to oldest, stopping at the first hit
 
-open(dir) ── replay the log to rebuild the memtable, truncating any torn tail
+open(dir) ── load the SSTables, then replay the log on top, truncating any torn tail
 ```
 
 Logging *before* applying is the whole game: the durable record can never be
 behind what a reader has already observed.
+
+When the memtable crosses a size threshold it is flushed to an immutable sorted
+file, an SSTable, and the log is rolled empty so both memory and log stay
+bounded. A read checks the memtable first, then walks the SSTables newest to
+oldest and stops at the first table that holds the key. Each table carries a
+bloom filter, so a read skips a table that provably lacks the key without
+touching its data, and a sparse index (one offset every sixteen keys) seeks
+close before a short forward scan.
+
+A delete does not erase the key. It writes a tombstone, a marker that outlives
+the memtable so that after a flush it still shadows an older value the same key
+may hold in an on-disk table. Tombstones are dropped only by a full compaction,
+which merges every table into one and, with no older table left to shadow, can
+finally discard them.
 
 ## Build and test
 
@@ -55,26 +69,38 @@ gradle test
 ```
 
 The tests are the interesting part. Beyond the round trips, `strata` is checked
-against an in-memory `TreeMap` oracle over five thousand random operations, and a
-dedicated test corrupts the tail of the log to prove recovery truncates it and
-the store stays writable.
+against an in-memory `TreeMap` oracle over thousands of random operations, once
+purely in memory and once with a flush threshold small enough that tables spill
+to disk mid-run. A dedicated test corrupts the tail of the log to prove recovery
+truncates it and the store stays writable, and others cover a tombstone
+shadowing an older on-disk value, recovery from SSTables and a log together, and
+a compaction that folds tables down and drops deleted keys.
 
 ## What is done, and what is next
 
-Done — the durable, recoverable write path and in-memory reads:
+Done, the durable write path over a memtable that now spills to disk:
 
 - Write-ahead log with CRC-checked, length-prefixed records and torn-tail recovery
 - Skip-list memtable with lock-free reads
 - Replay-on-open, tombstone deletes, value-copy isolation
+- **Flush.** A full memtable is written to an immutable, sorted SSTable and the
+  log is rolled empty, so memory and log size stay bounded.
+- **SSTables.** A documented block format with a sparse index and a bloom filter
+  per table, so a read skips a table that cannot hold the key and seeks close to
+  it in the table that can. Tombstones shadow older values across the boundary.
+- **Compaction.** A full merge of every SSTable into one that keeps the newest
+  value per key and discards tombstones once no older table survives them.
 
-Not done yet — the parts that take it from in-memory to on-disk at scale:
+Not done yet:
 
-- **Flush.** Roll a full memtable out to an immutable, sorted on-disk table
-  (an SSTable) and start a fresh log, so memory and log size stay bounded.
-- **SSTables.** A block format with a sparse index and a bloom filter per table,
-  so a read skips tables that cannot hold the key.
-- **Compaction.** Merge overlapping SSTables in the background to reclaim space
-  from overwritten and deleted keys and keep read amplification down.
+- **Leveled or tiered compaction.** Compaction here is a single full merge, not a
+  background, size-tiered one, so it does more work than it needs to and pauses
+  the writer while it runs.
+- **Block-level checksums and compression** inside an SSTable, and a block cache.
+  A read seeks straight to bytes on disk with no cache and no per-block integrity
+  check beyond the write-time fsync.
+- **Ordered scans** across the layers, which the sorted tables make cheap but
+  which the `Store` interface does not yet expose.
 
 The `Store` interface above these does not change as they land.
 

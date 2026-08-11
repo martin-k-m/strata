@@ -129,6 +129,27 @@ public final class WriteAheadLog implements AutoCloseable {
         }
     }
 
+    /**
+     * Empties the log and forces the truncation to disk, positioning it to append
+     * from the start again.
+     *
+     * A flush calls this once the memtable it covered is durable in an SSTable:
+     * those records are now redundant, so dropping them keeps the log bounded
+     * rather than letting it grow for the life of the store. The order at the call
+     * site matters. The SSTable must be fsynced and renamed into place first, so a
+     * crash between the two leaves the data still recoverable from this log rather
+     * than lost from a log already cleared.
+     */
+    public synchronized void reset() {
+        try {
+            channel.truncate(0);
+            channel.position(0);
+            channel.force(true); // the emptying itself must survive a crash
+        } catch (IOException e) {
+            throw new UncheckedIOException("write-ahead log reset failed", e);
+        }
+    }
+
     /** Forces every prior append to durable storage. */
     public synchronized void sync() {
         try {

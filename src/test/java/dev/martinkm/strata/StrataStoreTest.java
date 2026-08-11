@@ -7,14 +7,20 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.NavigableMap;
 import java.util.Random;
 import java.util.TreeMap;
+import java.util.stream.Stream;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.nio.file.StandardOpenOption.APPEND;
 import static java.nio.file.StandardOpenOption.WRITE;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class StrataStoreTest {
@@ -230,6 +236,116 @@ class StrataStoreTest {
             assertTrue(store.get(k("k7")).isEmpty());
             assertEquals(9, store.size());
         }
+    }
+
+    @Test
+    void scanMatchesATreeMapOracleAcrossLayers(@TempDir Path dir) {
+        // A tiny flush threshold spreads the live keys over the memtable and several
+        // stacked SSTables, so the scan has to k-way merge real layers, not one map.
+        Random rng = new Random(11);
+        TreeMap<String, byte[]> oracle = new TreeMap<>();
+        int keyspace = 250;
+
+        try (StrataStore store = StrataStore.open(dir, 24)) {
+            for (int i = 0; i < 6_000; i++) {
+                String key = "key-" + String.format("%03d", rng.nextInt(keyspace));
+                if (rng.nextInt(10) < 7) {
+                    byte[] value = randomBytes(rng, 1 + rng.nextInt(40));
+                    store.put(k(key), value);
+                    oracle.put(key, value);
+                } else {
+                    store.delete(k(key));
+                    oracle.remove(key);
+                }
+            }
+
+            assertScanMatches(store, oracle, null, null);
+            assertScanMatches(store, oracle, "key-050", "key-150");
+            assertScanMatches(store, oracle, null, "key-100");
+            assertScanMatches(store, oracle, "key-200", null);
+            assertScanMatches(store, oracle, "key-000", "key-249");
+            assertScanMatches(store, oracle, "key-123", "key-124"); // one key wide
+        }
+    }
+
+    @Test
+    void scanExcludesTombstonedKeys(@TempDir Path dir) {
+        // Threshold of one puts every write in its own table, so the deletes below
+        // are tombstones in newer tables shadowing values in older ones. The scan
+        // must skip them rather than surface the stale value.
+        try (StrataStore store = StrataStore.open(dir, 1)) {
+            for (int i = 0; i < 10; i++) {
+                store.put(k("k" + i), k("v" + i));
+            }
+            store.delete(k("k3"));
+            store.delete(k("k7"));
+
+            List<String> keys = scanKeys(store, null, null);
+            assertEquals(List.of("k0", "k1", "k2", "k4", "k5", "k6", "k8", "k9"), keys);
+            assertFalse(keys.contains("k3"));
+            assertFalse(keys.contains("k7"));
+
+            // A tombstone inside a requested range is dropped, not emitted.
+            assertEquals(List.of("k4", "k5", "k6"), scanKeys(store, "k3", "k7"));
+        }
+    }
+
+    @Test
+    void scanHandlesEmptyReversedAndOpenEndedRanges(@TempDir Path dir) {
+        try (StrataStore store = StrataStore.open(dir, 4)) {
+            for (int i = 0; i < 8; i++) {
+                store.put(k("k" + i), k("v" + i));
+            }
+
+            // Empty range: from equal to to excludes everything.
+            assertEquals(List.of(), scanKeys(store, "k3", "k3"));
+            // Reversed range: from after to yields nothing rather than throwing.
+            assertEquals(List.of(), scanKeys(store, "k5", "k2"));
+            // A range below every key, and one above every key.
+            assertEquals(List.of(), scanKeys(store, "a", "b"));
+            assertEquals(List.of(), scanKeys(store, "z", null));
+            // Open on both ends is the whole store, in order.
+            assertEquals(List.of("k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7"),
+                    scanKeys(store, null, null));
+        }
+    }
+
+    /** Asserts a scan over {@code [from, to)} equals the oracle's own sub-range. */
+    private static void assertScanMatches(StrataStore store, TreeMap<String, byte[]> oracle,
+                                          String from, String to) {
+        NavigableMap<String, byte[]> expected;
+        if (from == null && to == null) {
+            expected = oracle;
+        } else if (from == null) {
+            expected = oracle.headMap(to, false);
+        } else if (to == null) {
+            expected = oracle.tailMap(from, true);
+        } else {
+            expected = oracle.subMap(from, true, to, false);
+        }
+
+        List<Map.Entry<byte[], byte[]>> got = collect(store, from, to);
+        assertEquals(expected.size(), got.size(), "count for [" + from + "," + to + ")");
+        List<Map.Entry<String, byte[]>> want = new ArrayList<>(expected.entrySet());
+        for (int i = 0; i < want.size(); i++) {
+            assertEquals(want.get(i).getKey(), new String(got.get(i).getKey(), UTF_8), "key at " + i);
+            assertArrayEquals(want.get(i).getValue(), got.get(i).getValue(), "value at " + i);
+        }
+    }
+
+    private static List<Map.Entry<byte[], byte[]>> collect(StrataStore store, String from, String to) {
+        try (Stream<Map.Entry<byte[], byte[]>> s =
+                     store.scan(from == null ? null : k(from), to == null ? null : k(to))) {
+            return s.toList();
+        }
+    }
+
+    private static List<String> scanKeys(StrataStore store, String from, String to) {
+        List<String> keys = new ArrayList<>();
+        for (Map.Entry<byte[], byte[]> e : collect(store, from, to)) {
+            keys.add(new String(e.getKey(), UTF_8));
+        }
+        return keys;
     }
 
     private static byte[] randomBytes(Random rng, int len) {

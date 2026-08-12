@@ -57,6 +57,17 @@ public final class Benchmark {
             report("get (hit)", n, System.nanoTime() - t0);
             if (hits < 0) System.out.println(hits); // keep the JIT from dropping the loop
 
+            // The same gets again, now that the first pass has warmed the block cache.
+            // With many distinct keys the working set can exceed the cache, so this is
+            // an honest second pass, not a guaranteed all-hit run.
+            long warmHits = 0;
+            t0 = System.nanoTime();
+            for (int i = 0; i < n; i++) {
+                if (store.get(keys[i]).isPresent()) warmHits++;
+            }
+            report("get (warm)", n, System.nanoTime() - t0);
+            if (warmHits < 0) System.out.println(warmHits);
+
             byte[][] absent = new byte[n][];
             for (int i = 0; i < n; i++) {
                 absent[i] = ("absent-" + rng.nextInt(Integer.MAX_VALUE)).getBytes();

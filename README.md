@@ -98,7 +98,8 @@ gradle test
 ```
 
 There is also a small throughput harness. It fills a store with N random keys and
-prints puts, gets that hit, gets that miss and full scans as operations per second.
+prints puts, gets that hit, a second get pass over a warm block cache, gets that
+miss and full scans as operations per second.
 It is a timed loop, not JMH, so the numbers are rough magnitudes. Note that every
 put fsyncs the log, so the put rate is bound by the disk, not the code.
 
@@ -127,6 +128,22 @@ Done, the durable write path over a memtable that now spills to disk:
 - **SSTables.** A documented block format with a sparse index and a bloom filter
   per table, so a read skips a table that cannot hold the key and seeks close to
   it in the table that can. Tombstones shadow older values across the boundary.
+- **Block checksums.** The data is written in blocks of sixteen keys, each prefixed
+  with a CRC32 over its bytes, and the sparse index points at block headers. A read
+  reads and verifies one whole block. A mismatch raises a `ChecksumException` naming
+  the table and offset rather than returning bytes that no longer match what was
+  written. This is integrity on top of the write-time fsync, not a defence against a
+  malicious rewrite: the checksum lives in the same file, so it catches bit rot and
+  torn writes, not a deliberate edit of both the block and its CRC. The format marker
+  is bumped for the block layout, and `open` rejects an unrecognized one.
+- **Block cache.** A bounded, in-heap LRU of decoded blocks, keyed by table identity
+  plus offset, so a repeated read of a hot key is served from memory without a second
+  disk read or checksum check. It defaults to 1024 blocks and is configurable through
+  the third argument to `open`. The bound is a block count, not a byte budget, so a
+  cache of large blocks costs more memory than one of small blocks. Correctness does
+  not lean on it: tables are immutable and a compaction replaces a table rather than
+  mutating it, so the key never names stale bytes, and a retired table's blocks are
+  dropped when it closes.
 - **Leveled compaction.** Tables are organised into levels, level 0 straight from
   flushes and each level below a disjoint run whose budget is four times the one
   above. Level 0 merges into level 1 at four tables; a deeper level over its budget
@@ -148,9 +165,9 @@ Not done yet:
   per run, but it still happens on the writer's thread and pauses it while it runs
   rather than moving to a background thread. Level-0 tables also tend to span the
   whole key range, so an L0-into-L1 merge still rewrites much of level 1.
-- **Block-level checksums and compression** inside an SSTable, and a block cache.
-  A read seeks straight to bytes on disk with no cache and no per-block integrity
-  check beyond the write-time fsync.
+- **Block compression** inside an SSTable. Blocks are checksummed and cached now,
+  but they are stored uncompressed, so the on-disk size is the raw key and value
+  bytes with no attempt to shrink them.
 
 The `Store` interface above these does not change as they land.
 

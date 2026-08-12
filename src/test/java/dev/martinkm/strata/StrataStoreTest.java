@@ -6,6 +6,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -17,10 +18,12 @@ import java.util.stream.Stream;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.nio.file.StandardOpenOption.APPEND;
+import static java.nio.file.StandardOpenOption.READ;
 import static java.nio.file.StandardOpenOption.WRITE;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class StrataStoreTest {
@@ -413,6 +416,113 @@ class StrataStoreTest {
                 assertArrayEquals(e.getValue(), store.get(k(e.getKey())).orElseThrow(), e.getKey());
             }
             assertEquals(oracle.size(), store.size());
+        }
+    }
+
+    @Test
+    void aCorruptedDataBlockIsCaughtByItsChecksum(@TempDir Path dir) throws IOException {
+        // A hundred keys in one table span several blocks of sixteen keys each. Flush
+        // them to disk, then flip a byte inside the first block. A read of a key in that
+        // block must raise the checksum exception naming the table; a key in a later,
+        // intact block must still read back its value.
+        try (StrataStore store = StrataStore.open(dir, 1_000)) {
+            for (int i = 0; i < 100; i++) {
+                store.put(k("key-" + String.format("%03d", i)), k("val-" + i));
+            }
+            store.flush(); // every live key now sits in a single on-disk table
+        }
+
+        Path table = theSSTable(dir);
+        // Offset 12 is inside the first block's payload (past its 8-byte header), so
+        // flipping it changes an entry byte without touching the length prefix.
+        flipByte(table, 12);
+
+        // A fresh open starts with a cold cache, so the read genuinely goes to disk.
+        try (StrataStore store = StrataStore.open(dir, 1_000)) {
+            ChecksumException ex = assertThrows(ChecksumException.class,
+                    () -> store.get(k("key-000")));
+            assertTrue(ex.getMessage().contains(table.getFileName().toString()),
+                    "the exception should name the table: " + ex.getMessage());
+
+            // A key in a later block is untouched, so it reads back cleanly.
+            assertArrayEquals(k("val-99"), store.get(k("key-099")).orElseThrow());
+        }
+    }
+
+    @Test
+    void aRepeatedHotReadIsServedFromTheBlockCache(@TempDir Path dir) {
+        try (StrataStore store = StrataStore.open(dir, 1_000)) {
+            for (int i = 0; i < 100; i++) {
+                store.put(k("key-" + String.format("%03d", i)), k("val-" + i));
+            }
+            store.flush(); // push the keys to disk so a get reads a block
+
+            long misses0 = store.blockCacheMisses();
+            long hits0 = store.blockCacheHits();
+
+            assertArrayEquals(k("val-42"), store.get(k("key-042")).orElseThrow());
+            // First read of the key's block is a miss that loads it from disk.
+            assertEquals(misses0 + 1, store.blockCacheMisses());
+            assertEquals(hits0, store.blockCacheHits());
+
+            assertArrayEquals(k("val-42"), store.get(k("key-042")).orElseThrow());
+            // Second read of the same block is served from memory: a hit, no new miss.
+            assertEquals(misses0 + 1, store.blockCacheMisses());
+            assertEquals(hits0 + 1, store.blockCacheHits());
+        }
+    }
+
+    @Test
+    void matchesTheModelWithATinyBlockCacheThatEvicts(@TempDir Path dir) {
+        // A cache of two blocks against a store spread over many tables forces constant
+        // eviction. Correctness must not depend on the cache, so the oracle still holds.
+        Random rng = new Random(23);
+        TreeMap<String, byte[]> oracle = new TreeMap<>();
+        int keyspace = 300;
+
+        try (StrataStore store = StrataStore.open(dir, 32, 2)) {
+            for (int i = 0; i < 8_000; i++) {
+                String key = "key-" + String.format("%03d", rng.nextInt(keyspace));
+                if (rng.nextInt(10) < 7) {
+                    byte[] value = randomBytes(rng, 1 + rng.nextInt(40));
+                    store.put(k(key), value);
+                    oracle.put(key, value);
+                } else {
+                    store.delete(k(key));
+                    oracle.remove(key);
+                }
+            }
+
+            for (int n = 0; n < keyspace; n++) {
+                String key = "key-" + String.format("%03d", n);
+                var got = store.get(k(key));
+                if (oracle.containsKey(key)) {
+                    assertArrayEquals(oracle.get(key), got.orElseThrow(), key);
+                } else {
+                    assertTrue(got.isEmpty(), key + " should be absent");
+                }
+            }
+            assertEquals(oracle.size(), store.size());
+        }
+    }
+
+    /** The single SSTable file in {@code dir}, for tests that poke at the bytes on disk. */
+    private static Path theSSTable(Path dir) throws IOException {
+        try (Stream<Path> files = Files.list(dir)) {
+            List<Path> tables = files.filter(p -> p.getFileName().toString().endsWith(".sst")).toList();
+            assertEquals(1, tables.size(), "expected exactly one sstable");
+            return tables.get(0);
+        }
+    }
+
+    /** Flips every bit of the byte at {@code offset} in {@code file}, corrupting it. */
+    private static void flipByte(Path file, long offset) throws IOException {
+        try (FileChannel ch = FileChannel.open(file, READ, WRITE)) {
+            ByteBuffer one = ByteBuffer.allocate(1);
+            ch.read(one, offset);
+            one.flip();
+            byte corrupted = (byte) ~one.get();
+            ch.write(ByteBuffer.wrap(new byte[] {corrupted}), offset);
         }
     }
 

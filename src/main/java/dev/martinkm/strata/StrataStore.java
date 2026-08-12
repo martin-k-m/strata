@@ -99,6 +99,13 @@ public final class StrataStore implements Store {
     private final int flushThreshold;
 
     /**
+     * The shared cache of decoded SSTable blocks. It is bounded and in-heap, keyed by
+     * table identity plus offset, so a compaction that retires a table drops its blocks
+     * rather than serving stale ones.
+     */
+    private final BlockCache blockCache;
+
+    /**
      * Target number of entries per on-disk table below level 0. A merged run is
      * split into tables of about this many keys, so a level holds several tables that
      * can be moved down one at a time. It tracks the flush threshold, so a level's
@@ -114,16 +121,22 @@ public final class StrataStore implements Store {
     private volatile List<List<SSTable>> levels = new ArrayList<>();
     private long nextSeq;
 
-    private StrataStore(Path dir, WriteAheadLog wal, int flushThreshold) {
+    private StrataStore(Path dir, WriteAheadLog wal, int flushThreshold, int cacheBlocks) {
         this.dir = dir;
         this.wal = wal;
         this.flushThreshold = flushThreshold;
         this.targetTableEntries = Math.max(1, flushThreshold);
+        this.blockCache = new BlockCache(cacheBlocks);
     }
 
-    /** Opens a store at {@code dir} with the default flush threshold. */
+    /** Opens a store at {@code dir} with the default flush threshold and cache size. */
     public static StrataStore open(Path dir) {
         return open(dir, DEFAULT_FLUSH_THRESHOLD);
+    }
+
+    /** Opens a store at {@code dir} with the default block cache size. */
+    public static StrataStore open(Path dir, int flushThreshold) {
+        return open(dir, flushThreshold, BlockCache.DEFAULT_MAX_BLOCKS);
     }
 
     /**
@@ -131,15 +144,17 @@ public final class StrataStore implements Store {
      * existing SSTables and replaying the write-ahead log on top. A small
      * {@code flushThreshold} forces frequent flushes, which is mainly useful to
      * tests that want on-disk tables to exist without writing a lot of data.
+     * {@code cacheBlocks} bounds the decoded-block cache; a tiny value is mainly
+     * useful to tests that want to exercise eviction.
      */
-    public static StrataStore open(Path dir, int flushThreshold) {
+    public static StrataStore open(Path dir, int flushThreshold, int cacheBlocks) {
         try {
             Files.createDirectories(dir);
         } catch (IOException e) {
             throw new UncheckedIOException("cannot create store directory " + dir, e);
         }
         WriteAheadLog wal = WriteAheadLog.open(dir.resolve("wal.log"));
-        StrataStore store = new StrataStore(dir, wal, flushThreshold);
+        StrataStore store = new StrataStore(dir, wal, flushThreshold, cacheBlocks);
         store.loadSSTables();
         // Replay rebuilds the memtable in write order, so a later put/delete of a
         // key correctly wins over an earlier one. A delete replays as a tombstone,
@@ -312,7 +327,7 @@ public final class StrataStore implements Store {
 
         Path path = dir.resolve(sstableName(0, nextSeq));
         SSTable.write(path, entries); // fsynced and atomically renamed before it is opened
-        SSTable table = SSTable.open(path);
+        SSTable table = SSTable.open(path, blockCache);
         nextSeq++;
 
         // Publish the table into level 0 before clearing the memtable, so a concurrent
@@ -449,7 +464,7 @@ public final class StrataStore implements Store {
                     entries.subList(i, Math.min(i + targetTableEntries, entries.size()));
             Path path = dir.resolve(sstableName(target, nextSeq));
             SSTable.write(path, chunk);
-            out.add(SSTable.open(path));
+            out.add(SSTable.open(path, blockCache));
             nextSeq++;
         }
         return out;
@@ -461,6 +476,16 @@ public final class StrataStore implements Store {
         for (List<SSTable> level : levels) {
             for (SSTable table : level) table.close();
         }
+    }
+
+    /** Block reads served from the cache since open. For tests and introspection. */
+    long blockCacheHits() {
+        return blockCache.hitCount();
+    }
+
+    /** Block reads that missed the cache and touched disk since open. For tests. */
+    long blockCacheMisses() {
+        return blockCache.missCount();
     }
 
     /** The number of levels that currently hold at least one table. For tests. */
@@ -591,7 +616,7 @@ public final class StrataStore implements Store {
             int level = (int) parsed[0];
             long seq = parsed[1];
             while (loaded.size() <= level) loaded.add(new ArrayList<>());
-            loaded.get(level).add(SSTable.open(p));
+            loaded.get(level).add(SSTable.open(p, blockCache));
             maxSeq = Math.max(maxSeq, seq);
         }
 

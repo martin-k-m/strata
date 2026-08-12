@@ -2,6 +2,7 @@ package dev.martinkm.strata;
 
 import dev.martinkm.strata.util.Bytes;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
@@ -14,6 +15,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.zip.CRC32;
 
 /**
  * An immutable, sorted on-disk table: one flushed generation of the memtable.
@@ -26,11 +29,13 @@ import java.util.NoSuchElementException;
  * <h2>File layout</h2>
  *
  * <pre>
- *   data:   [entry]...                       every key, in sorted order
+ *   data:   [block]...                        every key, in sorted order, grouped into blocks
+ *             block = [payloadLen: int][crc32: int][entry...]
+ *                     crc32 is over the payload; a block holds up to INDEX_INTERVAL entries
  *             entry = [keyLen: int][key][valLen: int][value]
  *                     valLen = -1 marks a tombstone (a delete), which carries no value
- *   index:  [entry]...                       one entry per INDEX_INTERVAL data keys
- *             entry = [keyLen: int][key][offset: long]   offset points at the data entry
+ *   index:  [entry]...                        one entry per data block
+ *             entry = [keyLen: int][key][offset: long]   offset points at the block header
  *   bloom:  [numBits: int][numHashes: int][word: long]...
  *   footer: [dataLen: long][indexOffset: long][indexCount: int]
  *           [bloomOffset: long][entryCount: int][magic: long]
@@ -38,24 +43,36 @@ import java.util.NoSuchElementException;
  *
  * The footer is a fixed {@value #FOOTER_LEN} bytes at the very end, so opening a
  * table is: read the footer, then the (small, sparse) index and the bloom filter
- * into memory. The data block stays on disk and is touched only on a lookup that
+ * into memory. The data blocks stay on disk and are touched only on a lookup that
  * the bloom filter did not rule out.
  *
  * <p>The index is <em>sparse</em> on purpose: holding every key's offset in memory
- * would defeat the point of spilling to disk, so a lookup floors to the nearest
- * indexed key and scans forward a bounded number of entries from there. Reads and
- * a full scan are the only operations; there is no in-place update.
+ * would defeat the point of spilling to disk, so a lookup floors to the block that
+ * may hold the key and reads that one block. A block is the read unit and the unit
+ * a checksum covers, so a lookup reads and verifies exactly one block. A corrupt
+ * block raises a {@link ChecksumException} naming the table and offset rather than
+ * returning bytes that no longer match what was written.
+ *
+ * <p>Reads and a full scan are the only operations; there is no in-place update.
+ * Decoded blocks are cached in a {@link BlockCache} keyed by table and offset, so a
+ * repeated read of a hot key does not re-read or re-verify the same block.
  */
 final class SSTable {
 
-    /** A data entry offset every this many keys is kept in the sparse index. */
+    /** Data entries per block, and so the cadence of the sparse index: one entry per block. */
     static final int INDEX_INTERVAL = 16;
 
     /** Value length written for a tombstone. A real value is never negative length. */
     private static final int TOMBSTONE_LEN = -1;
 
-    private static final long MAGIC = 0x53545241544131L; // "STRATA1"
+    // The magic doubles as a format version. STRATA2 is the block-checksummed layout;
+    // a STRATA1 table (unblocked, no per-block checksum) is a different format and is
+    // rejected by open() rather than misread.
+    private static final long MAGIC = 0x53545241544132L; // "STRATA2"
     private static final int FOOTER_LEN = 8 + 8 + 4 + 8 + 4 + 8;
+
+    /** Assigns each opened table a distinct identity, used to key its blocks in the cache. */
+    private static final AtomicLong NEXT_ID = new AtomicLong();
 
     /**
      * The outcome of a point lookup in one table. Absent and tombstone are
@@ -96,8 +113,17 @@ final class SSTable {
     /** One key and its value, or a tombstone, as read back from a table. */
     record Entry(Bytes key, byte[] value, boolean tombstone) {}
 
+    /**
+     * A decoded data block: its entries in key order and the offset just past it in
+     * the data region, which is where the next block begins. This is what the cache
+     * holds, so a cached read touches no disk.
+     */
+    record Block(Entry[] entries, long endOffset) {}
+
     private final FileChannel channel;
     private final Path path;
+    private final BlockCache cache;
+    private final long id;
     private final BloomFilter bloom;
     private final Bytes[] indexKeys;
     private final long[] indexOffsets;
@@ -106,11 +132,13 @@ final class SSTable {
     private final Bytes firstKey;
     private final Bytes lastKey;
 
-    private SSTable(FileChannel channel, Path path, BloomFilter bloom,
+    private SSTable(FileChannel channel, Path path, BlockCache cache, long id, BloomFilter bloom,
                     Bytes[] indexKeys, long[] indexOffsets, long dataLen, int entryCount,
                     Bytes firstKey, Bytes lastKey) {
         this.channel = channel;
         this.path = path;
+        this.cache = cache;
+        this.id = id;
         this.bloom = bloom;
         this.indexKeys = indexKeys;
         this.indexOffsets = indexOffsets;
@@ -124,9 +152,12 @@ final class SSTable {
      * Writes {@code entries} (already in ascending key order, tombstones carrying
      * a null value) to a new immutable table at {@code path}.
      *
-     * The table is built into a temporary sibling file, fsynced, then atomically
-     * renamed into place. A crash therefore leaves either no table or a complete
-     * one, never a half-written file that a later open would trip over.
+     * The data is grouped into blocks of at most {@link #INDEX_INTERVAL} entries.
+     * Each block is prefixed with its length and a CRC32 over its bytes, and the
+     * sparse index holds one entry per block pointing at the block header. The table
+     * is built into a temporary sibling file, fsynced, then atomically renamed into
+     * place. A crash therefore leaves either no table or a complete one, never a
+     * half-written file that a later open would trip over.
      */
     static void write(Path path, List<Map.Entry<Bytes, byte[]>> entries) {
         Path tmp = path.resolveSibling(path.getFileName() + ".tmp");
@@ -140,19 +171,26 @@ final class SSTable {
                 StandardOpenOption.TRUNCATE_EXISTING)) {
 
             long offset = 0;
-            int i = 0;
+            int inBlock = 0;
+            ByteArrayOutputStream payload = new ByteArrayOutputStream();
             for (Map.Entry<Bytes, byte[]> e : entries) {
                 byte[] key = e.getKey().toArray();
                 byte[] value = e.getValue();
                 bloom.add(key);
-                if (i % INDEX_INTERVAL == 0) {
+                if (inBlock == INDEX_INTERVAL) {
+                    offset += writeBlock(ch, payload.toByteArray());
+                    payload.reset();
+                    inBlock = 0;
+                }
+                if (inBlock == 0) { // the first key of a block anchors the index
                     indexKeys.add(key);
                     indexOffsets.add(offset);
                 }
-                ByteBuffer buf = encodeEntry(key, value);
-                offset += buf.remaining();
-                writeFully(ch, buf);
-                i++;
+                encodeEntry(payload, key, value);
+                inBlock++;
+            }
+            if (inBlock > 0) {
+                offset += writeBlock(ch, payload.toByteArray());
             }
             long dataLen = offset;
 
@@ -196,7 +234,7 @@ final class SSTable {
     }
 
     /** Opens an existing table, loading its index and bloom filter into memory. */
-    static SSTable open(Path path) {
+    static SSTable open(Path path, BlockCache cache) {
         try {
             FileChannel ch = FileChannel.open(path, StandardOpenOption.READ);
             long size = ch.size();
@@ -210,7 +248,7 @@ final class SSTable {
             int entryCount = footer.getInt();
             long magic = footer.getLong();
             if (magic != MAGIC) {
-                throw new IOException("not a strata sstable (bad magic) " + path);
+                throw new IOException("unrecognized sstable format (bad magic) " + path);
             }
 
             int indexLen = (int) (bloomOffset - indexOffset);
@@ -234,15 +272,19 @@ final class SSTable {
             for (int i = 0; i < words.length; i++) words[i] = bloomBuf.getLong();
             BloomFilter bloom = BloomFilter.load(numBits, numHashes, words);
 
-            // The first and last keys bound the table's range, which the levels use
-            // to keep runs disjoint and to test two tables for overlap. The first key
-            // is the first indexed key; the last is found by scanning forward from the
-            // last index entry, which is at most INDEX_INTERVAL entries away.
+            // The first and last keys bound the table's range, which the levels use to
+            // keep runs disjoint and to test two tables for overlap. The first key is
+            // the first indexed key; the last is the last entry of the last block.
             Bytes firstKey = (indexCount > 0) ? indexKeys[0] : null;
-            Bytes lastKey = (entryCount > 0) ? lastKeyFrom(ch, indexOffsets[indexCount - 1], dataLen) : null;
+            Bytes lastKey = null;
+            if (entryCount > 0) {
+                Entry[] lastEntries = readBlockRaw(ch, path, indexOffsets[indexCount - 1]).entries();
+                lastKey = lastEntries[lastEntries.length - 1].key();
+            }
 
-            return new SSTable(ch, path, bloom, indexKeys, indexOffsets, dataLen, entryCount,
-                    firstKey, lastKey);
+            long id = NEXT_ID.getAndIncrement();
+            return new SSTable(ch, path, cache, id, bloom, indexKeys, indexOffsets, dataLen,
+                    entryCount, firstKey, lastKey);
         } catch (IOException ex) {
             throw new UncheckedIOException("cannot open sstable " + path, ex);
         }
@@ -271,27 +313,6 @@ final class SSTable {
         return dataLen;
     }
 
-    /** Decodes keys forward from {@code start} to {@code end}, returning the last one. */
-    private static Bytes lastKeyFrom(FileChannel ch, long start, long end) throws IOException {
-        long pos = start;
-        Bytes last = null;
-        while (pos < end) {
-            ByteBuffer header = readAt(ch, pos, 4);
-            header.flip();
-            int keyLen = header.getInt();
-            ByteBuffer keyBuf = readAt(ch, pos + 4, keyLen);
-            keyBuf.flip();
-            byte[] key = new byte[keyLen];
-            keyBuf.get(key);
-            ByteBuffer valLenBuf = readAt(ch, pos + 4 + keyLen, 4);
-            valLenBuf.flip();
-            int valLen = valLenBuf.getInt();
-            last = Bytes.wrap(key);
-            pos += 4 + keyLen + 4 + Math.max(valLen, 0);
-        }
-        return last;
-    }
-
     /**
      * Looks up {@code key}. Returns {@link Result#ABSENT} if this table does not
      * hold the key, a value result if it does, or {@link Result#TOMBSTONE} if the
@@ -300,46 +321,26 @@ final class SSTable {
     Result get(byte[] key) {
         // The bloom filter turns most misses into no disk work at all.
         if (!bloom.mightContain(key)) return Result.ABSENT;
+        if (entryCount == 0) return Result.ABSENT;
 
         Bytes target = Bytes.wrap(key);
-        long pos = floorOffset(target);
-        try {
-            while (pos < dataLen) {
-                ByteBuffer header = readAt(channel, pos, 4);
-                header.flip();
-                int keyLen = header.getInt();
-                ByteBuffer keyBuf = readAt(channel, pos + 4, keyLen);
-                keyBuf.flip();
-                byte[] entryKey = new byte[keyLen];
-                keyBuf.get(entryKey);
-
-                int cmp = Bytes.wrap(entryKey).compareTo(target);
-                ByteBuffer valLenBuf = readAt(channel, pos + 4 + keyLen, 4);
-                valLenBuf.flip();
-                int valLen = valLenBuf.getInt();
-
-                if (cmp == 0) {
-                    if (valLen == TOMBSTONE_LEN) return Result.TOMBSTONE;
-                    ByteBuffer valBuf = readAt(channel, pos + 4 + keyLen + 4, valLen);
-                    valBuf.flip();
-                    byte[] value = new byte[valLen];
-                    valBuf.get(value);
-                    return Result.of(value);
-                }
-                if (cmp > 0) return Result.ABSENT; // sorted: we have passed where it would be
-
-                pos += 4 + keyLen + 4 + Math.max(valLen, 0);
+        // The floor offset names the one block that could hold the key: the next
+        // indexed key is strictly greater, so a present key sits in this block.
+        Block block = readBlock(floorOffset(target));
+        for (Entry e : block.entries()) {
+            int cmp = e.key().compareTo(target);
+            if (cmp == 0) {
+                return e.tombstone() ? Result.TOMBSTONE : Result.of(e.value().clone());
             }
-        } catch (IOException ex) {
-            throw new UncheckedIOException("sstable read failed " + path, ex);
+            if (cmp > 0) return Result.ABSENT; // sorted: we have passed where it would be
         }
         return Result.ABSENT;
     }
 
     /**
      * A one-pass reader over every entry in key order, tombstones included.
-     * Compaction uses it to merge tables; it is not a general cursor and holds a
-     * position in the shared channel, so it is single-threaded by construction.
+     * Compaction uses it to merge tables; it is not a general cursor and reads whole
+     * blocks through the shared channel, so it is single-threaded by construction.
      */
     Iterator scan() {
         return new Iterator(0, null, null);
@@ -347,8 +348,8 @@ final class SSTable {
 
     /**
      * A reader over entries with key in {@code [from, to)} in key order, tombstones
-     * included. A {@code null} bound is open on that side. The sparse index seeks
-     * close to {@code from} so a bounded scan does not read the whole table.
+     * included. A {@code null} bound is open on that side. The sparse index seeks to
+     * the block holding {@code from} so a bounded scan does not read the whole table.
      */
     Iterator scan(byte[] from, byte[] to) {
         long start = (from == null) ? 0 : floorOffset(Bytes.wrap(from));
@@ -356,13 +357,16 @@ final class SSTable {
     }
 
     final class Iterator {
-        private long pos;
+        private long blockOffset;
+        private Block block;
+        private int idx;
+        private boolean done;
         private final Bytes from;
         private final Bytes to;
         private Entry buffered;
 
-        Iterator(long startPos, byte[] from, byte[] to) {
-            this.pos = startPos;
+        Iterator(long startBlockOffset, byte[] from, byte[] to) {
+            this.blockOffset = startBlockOffset;
             this.from = (from == null) ? null : Bytes.wrap(from);
             this.to = (to == null) ? null : Bytes.wrap(to);
             buffered = readNextInRange();
@@ -380,54 +384,37 @@ final class SSTable {
         }
 
         /**
-         * Decodes forward from {@code pos} to the next entry whose key falls in
-         * range, or null past the end. The floor offset can land before {@code from},
-         * so entries below it are skipped; the first key at or above {@code to} ends
-         * the scan.
+         * Walks block by block to the next entry whose key falls in range, or null
+         * past the end. The starting block can begin before {@code from}, so entries
+         * below it are skipped; the first key at or above {@code to} ends the scan.
          */
         private Entry readNextInRange() {
-            try {
-                while (pos < dataLen) {
-                    ByteBuffer header = readAt(channel, pos, 4);
-                    header.flip();
-                    int keyLen = header.getInt();
-                    ByteBuffer keyBuf = readAt(channel, pos + 4, keyLen);
-                    keyBuf.flip();
-                    byte[] key = new byte[keyLen];
-                    keyBuf.get(key);
-                    ByteBuffer valLenBuf = readAt(channel, pos + 4 + keyLen, 4);
-                    valLenBuf.flip();
-                    int valLen = valLenBuf.getInt();
-
-                    Entry entry;
-                    if (valLen == TOMBSTONE_LEN) {
-                        pos += 4 + keyLen + 4;
-                        entry = new Entry(Bytes.wrap(key), null, true);
-                    } else {
-                        ByteBuffer valBuf = readAt(channel, pos + 4 + keyLen + 4, valLen);
-                        valBuf.flip();
-                        byte[] value = new byte[valLen];
-                        valBuf.get(value);
-                        pos += 4 + keyLen + 4 + valLen;
-                        entry = new Entry(Bytes.wrap(key), value, false);
-                    }
-
-                    Bytes k = entry.key();
-                    if (from != null && k.compareTo(from) < 0) continue; // floor landed early
-                    if (to != null && k.compareTo(to) >= 0) {            // past the range
-                        pos = dataLen;
+            while (true) {
+                if (done) return null;
+                if (block == null || idx >= block.entries().length) {
+                    if (blockOffset >= dataLen) {
+                        done = true;
                         return null;
                     }
-                    return entry;
+                    block = readBlock(blockOffset);
+                    blockOffset = block.endOffset();
+                    idx = 0;
+                    continue;
                 }
-                return null;
-            } catch (IOException ex) {
-                throw new UncheckedIOException("sstable scan failed " + path, ex);
+                Entry entry = block.entries()[idx++];
+                Bytes k = entry.key();
+                if (from != null && k.compareTo(from) < 0) continue; // block started early
+                if (to != null && k.compareTo(to) >= 0) {            // past the range
+                    done = true;
+                    return null;
+                }
+                return entry;
             }
         }
     }
 
     void close() {
+        cache.invalidate(id); // a retired table's blocks must never be served again
         try {
             channel.close();
         } catch (IOException ex) {
@@ -435,7 +422,7 @@ final class SSTable {
         }
     }
 
-    /** The data offset of the last indexed key at or before {@code target}, else 0. */
+    /** The offset of the block whose first key is the greatest indexed key <= target, else 0. */
     private long floorOffset(Bytes target) {
         // Binary search the sparse index for the greatest key <= target.
         int lo = 0, hi = indexKeys.length - 1, ans = -1;
@@ -451,15 +438,78 @@ final class SSTable {
         return ans < 0 ? 0 : indexOffsets[ans];
     }
 
-    private static ByteBuffer encodeEntry(byte[] key, byte[] value) {
+    /**
+     * Returns the decoded block at {@code offset}, from the cache if it is there or
+     * from disk otherwise. A disk read verifies the block's checksum before it is
+     * cached, so a cached block has already been checked once and is not re-verified.
+     */
+    private Block readBlock(long offset) {
+        BlockCache.Key key = new BlockCache.Key(id, offset);
+        Block cached = cache.get(key);
+        if (cached != null) return cached;
+        try {
+            Block block = readBlockRaw(channel, path, offset);
+            cache.put(key, block);
+            return block;
+        } catch (IOException ex) {
+            throw new UncheckedIOException("sstable read failed " + path, ex);
+        }
+    }
+
+    /**
+     * Reads the block header and payload at {@code offset}, checks the CRC and decodes
+     * the entries. A mismatch means the bytes on disk no longer match what was written,
+     * so it raises a {@link ChecksumException} rather than returning corrupt data.
+     */
+    private static Block readBlockRaw(FileChannel ch, Path path, long offset) throws IOException {
+        ByteBuffer header = readAt(ch, offset, 8);
+        header.flip();
+        int payloadLen = header.getInt();
+        int expectedCrc = header.getInt();
+
+        ByteBuffer payload = readAt(ch, offset + 8, payloadLen);
+        payload.flip();
+        CRC32 crc = new CRC32();
+        crc.update(payload.duplicate());
+        if ((int) crc.getValue() != expectedCrc) {
+            throw new ChecksumException(path, offset);
+        }
+
+        List<Entry> entries = new ArrayList<>();
+        while (payload.hasRemaining()) {
+            byte[] key = new byte[payload.getInt()];
+            payload.get(key);
+            int valLen = payload.getInt();
+            if (valLen == TOMBSTONE_LEN) {
+                entries.add(new Entry(Bytes.wrap(key), null, true));
+            } else {
+                byte[] value = new byte[valLen];
+                payload.get(value);
+                entries.add(new Entry(Bytes.wrap(key), value, false));
+            }
+        }
+        return new Block(entries.toArray(new Entry[0]), offset + 8 + payloadLen);
+    }
+
+    /** Appends one entry's bytes to {@code out}. A null value is a tombstone. */
+    private static void encodeEntry(ByteArrayOutputStream out, byte[] key, byte[] value) {
         boolean tombstone = value == null;
         int valLen = tombstone ? 0 : value.length;
         ByteBuffer buf = ByteBuffer.allocate(4 + key.length + 4 + valLen);
         buf.putInt(key.length).put(key);
         buf.putInt(tombstone ? TOMBSTONE_LEN : value.length);
         if (!tombstone) buf.put(value);
-        buf.flip();
-        return buf;
+        out.writeBytes(buf.array());
+    }
+
+    /** Writes one block ([len][crc][payload]) and returns the bytes it occupies. */
+    private static long writeBlock(FileChannel ch, byte[] payload) throws IOException {
+        CRC32 crc = new CRC32();
+        crc.update(payload);
+        ByteBuffer buf = ByteBuffer.allocate(8 + payload.length);
+        buf.putInt(payload.length).putInt((int) crc.getValue()).put(payload).flip();
+        writeFully(ch, buf);
+        return 8L + payload.length;
     }
 
     private static void writeFully(FileChannel ch, ByteBuffer buf) throws IOException {

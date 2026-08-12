@@ -116,6 +116,39 @@ truncates it and the store stays writable, and others cover a tombstone
 shadowing an older on-disk value, recovery from SSTables and a log together, and
 a compaction that folds tables down and drops deleted keys.
 
+## Command line
+
+There is a small CLI over the store, so it is usable from a shell and not only as
+a library. It runs through the `application` plugin:
+
+```bash
+gradle run --args="put mydir foo bar"
+gradle run --args="get mydir foo"
+gradle run --args="scan mydir"
+```
+
+The first argument is the command, the second is the store directory:
+
+```
+put <dir> <key> <value>   store the pair, print ok
+get <dir> <key>           print the value, exit 0 if present, exit 1 if absent
+delete <dir> <key>        remove the key
+scan <dir> [from] [to]    print key\tvalue lines in key order over [from, to)
+compact <dir>             run a full compaction
+info <dir>                print the live key count and a short summary
+```
+
+Missing scan bounds mean open on that side, so `scan mydir b` runs from `b` to
+the end and `scan mydir "" c` runs from the start up to but not including `c`.
+An unknown command or a wrong argument count prints a short usage to stderr and
+exits 2.
+
+Keys and values are UTF-8 text, encoded to bytes for the store. Values with a
+tab or a newline are out of scope, because `scan` prints one `key\tvalue` pair
+per line, so keep keys and values to plain single-line text. Each invocation
+opens the store, does its work and closes it, so run one strata command against
+a directory at a time; the store is single-writer.
+
 ## What is done, and what is next
 
 Done, the durable write path over a memtable that now spills to disk:

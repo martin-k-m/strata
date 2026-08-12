@@ -1,5 +1,6 @@
 plugins {
     `java-library`
+    application
 }
 
 group = "dev.martinkm"
@@ -9,6 +10,11 @@ java {
     toolchain {
         languageVersion = JavaLanguageVersion.of(21)
     }
+}
+
+// The command-line front end: gradle run --args="get mydir foo".
+application {
+    mainClass = "dev.martinkm.strata.Cli"
 }
 
 repositories {

@@ -1,5 +1,10 @@
 # strata
 
+[![CI](https://github.com/martin-k-m/strata/actions/workflows/ci.yml/badge.svg)](https://github.com/martin-k-m/strata/actions/workflows/ci.yml)
+[![Java](https://img.shields.io/badge/java-21+-ED8B00?logo=openjdk&logoColor=fff)](https://openjdk.org)
+[![Dependencies](https://img.shields.io/badge/runtime%20dependencies-0-7C6CFF)](build.gradle.kts)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A log-structured key-value store in Java, built from the write path up.
 
 `strata` is an [LSM-tree](https://en.wikipedia.org/wiki/Log-structured_merge-tree)

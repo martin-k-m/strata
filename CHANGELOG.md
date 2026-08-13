@@ -7,6 +7,13 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Property and crash-fuzz tests (`StrataDurabilityPropertyTest`) that quantify
+  the durability guarantees over the whole failure space: recovery yields a valid
+  write-history prefix after truncation at *every* byte offset and after *every*
+  single-byte corruption of the log, scan order is verified unsigned-lexicographic
+  across the high byte range, empty values round-trip distinctly from deletes, and
+  recovery stays correct across many mid-stream restarts. JUnit only, no new
+  dependency.
 - Contribution, security, and changelog documentation, and status badges in the
   README.
 

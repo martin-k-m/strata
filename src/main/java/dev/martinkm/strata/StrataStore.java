@@ -46,6 +46,18 @@ import java.util.stream.StreamSupport;
  * locking, which is why a flush publishes the new table before it clears the
  * memtable, so a key is never briefly absent from both.
  *
+ * <p>Compaction needs the same care in the other direction. It publishes the new
+ * level structure before it retires the tables it consumed, so no read starting
+ * afterwards can find them, but a read that started earlier is already walking
+ * one. Those tables are therefore reference counted: a reader takes a reference
+ * on every table it is about to read and gives it back when it is done, and a
+ * retired table is closed and deleted by whichever of them leaves last. A reader
+ * that arrives just too late to take one retakes its snapshot instead, and finds
+ * the same keys in the tables the compaction wrote.
+ *
+ * <p>{@link #scan} reads its tables lazily, so it holds its references until the
+ * stream is closed. Close it, as with any stream over a file.
+ *
  * <h2>Levels</h2>
  *
  * On-disk tables are organised into levels, which is what keeps a compaction from
@@ -189,19 +201,56 @@ public final class StrataStore implements Store {
         // before clearing the memtable, so a key is present in at least one of the
         // two references we read here.
         ConcurrentNavigableMap<Bytes, byte[]> mem = memtable;
-        List<SSTable> tables = readOrder(levels);
+        List<SSTable> tables = hold();
 
-        byte[] fromMem = mem.get(Bytes.wrap(key));
-        if (fromMem != null) {
-            return fromMem == TOMBSTONE ? Optional.empty() : Optional.of(fromMem.clone());
-        }
-        for (SSTable table : tables) { // newest to oldest
-            SSTable.Result r = table.get(key);
-            if (r.isPresent()) {
-                return r.isTombstone() ? Optional.empty() : Optional.of(r.value());
+        try {
+            byte[] fromMem = mem.get(Bytes.wrap(key));
+            if (fromMem != null) {
+                return fromMem == TOMBSTONE ? Optional.empty() : Optional.of(fromMem.clone());
             }
+            for (SSTable table : tables) { // newest to oldest
+                SSTable.Result r = table.get(key);
+                if (r.isPresent()) {
+                    return r.isTombstone() ? Optional.empty() : Optional.of(r.value());
+                }
+            }
+            return Optional.empty();
+        } finally {
+            for (SSTable table : tables) table.release();
         }
-        return Optional.empty();
+    }
+
+    /**
+     * The tables to read, newest first, each with a reference taken so that a
+     * compaction cannot retire it out from under the read.
+     *
+     * <p>The snapshot of {@code levels} and the taking of the references are two
+     * steps, so a compaction can retire a table in between. That shows up as a
+     * failed {@code acquire}, and the answer is to take a fresh snapshot: the
+     * retired table's contents were merged into the new structure before it was
+     * retired, so the newer snapshot has them. Compaction publishes before it
+     * retires, which is what makes retrying converge rather than chase.
+     *
+     * <p>The caller must release every table it is given.
+     */
+    private List<SSTable> hold() {
+        for (; ; ) {
+            List<SSTable> candidates = readOrder(levels);
+            List<SSTable> held = new ArrayList<>(candidates.size());
+            boolean complete = true;
+            for (SSTable table : candidates) {
+                if (table.acquire()) {
+                    held.add(table);
+                } else {
+                    complete = false;
+                    break;
+                }
+            }
+            if (complete) {
+                return held;
+            }
+            for (SSTable table : held) table.release();
+        }
     }
 
     @Override
@@ -220,13 +269,18 @@ public final class StrataStore implements Store {
         // Snapshot the layers the way get() does: a concurrent flush publishes its
         // table before clearing the memtable, so no live key falls between the two.
         ConcurrentNavigableMap<Bytes, byte[]> mem = memtable;
-        List<SSTable> tables = readOrder(levels);
 
         // A reversed or empty range has nothing in it, and the memtable's subMap
         // would reject a reversed one, so answer it directly.
         if (from != null && to != null && Bytes.wrap(from).compareTo(Bytes.wrap(to)) >= 0) {
             return Stream.empty();
         }
+
+        // Held for as long as the stream is being consumed, not just for the call:
+        // a scan reads its tables lazily, so it is inside them until it is closed.
+        // That is why the returned stream must be closed, as every stream over a
+        // file has to be, and why every caller here uses it in a try-with-resources.
+        List<SSTable> tables = hold();
 
         // One source per layer, newest first: the memtable, then the SSTables newest
         // to oldest. Each yields cells in key order, which is what the merge needs.
@@ -240,8 +294,13 @@ public final class StrataStore implements Store {
         Spliterator<MergingIterator.Cell> spliterator = Spliterators.spliteratorUnknownSize(
                 merged, Spliterator.ORDERED | Spliterator.NONNULL);
         return StreamSupport.stream(spliterator, false)
-                .map(cell -> new AbstractMap.SimpleImmutableEntry<byte[], byte[]>(
-                        cell.key().toArray(), cell.value().clone()));
+                // The witness keeps the stream typed as the declared return type
+                // rather than as the concrete entry, so onClose below returns it.
+                .<Map.Entry<byte[], byte[]>>map(cell -> new AbstractMap.SimpleImmutableEntry<>(
+                        cell.key().toArray(), cell.value().clone()))
+                .onClose(() -> {
+                    for (SSTable table : tables) table.release();
+                });
     }
 
     /** The memtable rows in {@code [from, to)} as merge cells, tombstones marked. */
@@ -419,15 +478,14 @@ public final class StrataStore implements Store {
         newTarget.sort(java.util.Comparator.comparing(SSTable::firstKey));
         levels = updated;
 
-        // The consumed inputs are unreferenced now; close and remove their files.
-        List<SSTable> consumed = new ArrayList<>(sources);
-        for (SSTable old : consumed) {
-            old.close();
-            try {
-                Files.deleteIfExists(old.path());
-            } catch (IOException e) {
-                throw new UncheckedIOException("cannot remove compacted sstable " + old.path(), e);
-            }
+        // The consumed inputs are out of the level structure now, so no new read
+        // will find them. A read that started before the line above may still be
+        // inside one, so this drops the store's own reference and leaves the close
+        // and the delete to whoever leaves last. Closing them here regardless is
+        // what this replaced: a reader part way through a consumed table hit a
+        // closed channel and failed a lookup for a key that never went anywhere.
+        for (SSTable old : new ArrayList<>(sources)) {
+            old.retire();
         }
         return true;
     }

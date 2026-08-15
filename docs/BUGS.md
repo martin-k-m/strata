@@ -130,10 +130,10 @@ disk forever.
 
 ## STRATA-2: a crash during a compaction resurrects overwritten and deleted keys
 
-**Status:** fixed in [`39786a4`](https://github.com/martin-k-m/strata/commit/39786a4). A `manifest` file now records the set of live
-tables and is replaced by an atomic rename, so the set changes in one step. See
-[DECISIONS.md](DECISIONS.md) for why the store went without one for as long as it
-did, and what it cost.
+**Status:** fixed in [`2b4df0e`](https://github.com/martin-k-m/strata/commit/2b4df0e).
+A `manifest` file now records the set of live tables and is replaced by an atomic
+rename, so the set changes in one step. See [DECISIONS.md](DECISIONS.md) for why
+the store went without one for as long as it did, and what it cost.
 
 ### Symptom
 
@@ -143,10 +143,10 @@ as present.
 
 ### Root cause
 
-The file names are the entire manifest. A table is `sst-<level>-<seq>.sst`, and
-`open` rebuilds the level structure from the directory listing alone: the level
+The file names were the entire manifest. A table is `sst-<level>-<seq>.sst`, and
+`open` rebuilt the level structure from the directory listing alone: the level
 says which level a table belongs to, the sequence orders the level-0 stack. There
-is no manifest file, and so nothing that changes the *set* of table files
+was no manifest file, and so nothing that changed the *set* of table files
 atomically.
 
 A compaction is two separate durable steps. First it writes its output tables,

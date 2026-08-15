@@ -57,10 +57,6 @@ class StrataCrashConsistencyTest {
      * newer.
      */
     @Test
-    @Disabled("Known defect, documented in docs/BUGS.md as STRATA-2. This test fails: it "
-            + "returns old-0 for a key last written as new-0. The fix needs a manifest, so the "
-            + "set of table files changes atomically; that is not built yet, and this test is "
-            + "kept as its specification rather than deleted.")
     void aCrashBetweenCompactionOutputAndInputDeletionKeepsTheNewestValue(@TempDir Path root)
             throws IOException {
         Path dir = root.resolve("store");
@@ -72,28 +68,29 @@ class StrataCrashConsistencyTest {
             store.flush();
             store.compact();
         }
-        Map<String, byte[]> before = tableFiles(dir);
 
-        // Overwrite every key, then compact so the new values are merged down into
-        // the levels the old ones occupy. This is the compaction that will crash.
+        // Overwrite every key and flush, but stop short of compacting. This is the
+        // state the store is in at the instant the doomed compaction starts, so this
+        // manifest is the one still on disk when it dies part way through.
         try (StrataStore store = StrataStore.open(dir, 8)) {
             for (int i = 0; i < keys; i++) store.put(key(i), k("new-" + i));
             store.flush();
+        }
+        Map<String, byte[]> before = tableFiles(dir);
+        byte[] manifestBefore = manifest(dir);
+
+        // Now the compaction that will crash: it merges the new values down into the
+        // levels the old ones occupy.
+        try (StrataStore store = StrataStore.open(dir, 8)) {
             store.compact();
         }
         Map<String, byte[]> after = tableFiles(dir);
 
-        // The crashed directory: everything the compaction wrote, plus everything
-        // it consumed but never got to delete.
-        Path crashed = root.resolve("crashed");
-        Files.createDirectories(crashed);
-        Map<String, byte[]> union = new HashMap<>(before);
-        union.putAll(after);
-        for (Map.Entry<String, byte[]> e : union.entrySet()) {
-            Files.write(crashed.resolve(e.getKey()), e.getValue());
-        }
-        assertTrue(union.size() > after.size(),
-                "the compaction must have deleted some table, or this simulates nothing");
+        // The crashed directory: everything the compaction wrote, plus everything it
+        // consumed but never got to delete, under the manifest that had not yet been
+        // replaced. Both sets of files are present and complete. The manifest is the
+        // only thing that says which of them is the store.
+        Path crashed = crashedDir(root, "crashed", before, after, manifestBefore);
 
         try (StrataStore store = StrataStore.open(crashed, 8)) {
             for (int i = 0; i < keys; i++) {
@@ -114,9 +111,6 @@ class StrataCrashConsistencyTest {
      * notices, because the store told them it was gone.
      */
     @Test
-    @Disabled("Known defect, documented in docs/BUGS.md as STRATA-2. This test fails: a key "
-            + "deleted before the crash reads back as present. Same root cause and same fix as "
-            + "the test above.")
     void aCrashDuringCompactionDoesNotResurrectADeletedKey(@TempDir Path root) throws IOException {
         Path dir = root.resolve("store");
         int keys = 200;
@@ -126,22 +120,20 @@ class StrataCrashConsistencyTest {
             store.flush();
             store.compact();
         }
-        Map<String, byte[]> before = tableFiles(dir);
 
         try (StrataStore store = StrataStore.open(dir, 8)) {
             for (int i = 0; i < keys; i += 2) store.delete(key(i));
             store.flush();
+        }
+        Map<String, byte[]> before = tableFiles(dir);
+        byte[] manifestBefore = manifest(dir);
+
+        try (StrataStore store = StrataStore.open(dir, 8)) {
             store.compact();
         }
         Map<String, byte[]> after = tableFiles(dir);
 
-        Path crashed = root.resolve("crashed");
-        Files.createDirectories(crashed);
-        Map<String, byte[]> union = new HashMap<>(before);
-        union.putAll(after);
-        for (Map.Entry<String, byte[]> e : union.entrySet()) {
-            Files.write(crashed.resolve(e.getKey()), e.getValue());
-        }
+        Path crashed = crashedDir(root, "crashed", before, after, manifestBefore);
 
         try (StrataStore store = StrataStore.open(crashed, 8)) {
             for (int i = 0; i < keys; i++) {
@@ -153,6 +145,62 @@ class StrataCrashConsistencyTest {
                 }
             }
         }
+    }
+
+    /**
+     * The other side of the same instant: a crash after the compaction committed but
+     * before it deleted the tables it consumed.
+     *
+     * <p>The directory looks identical to the case above. Both sets of files are
+     * present and complete, and nothing in a table file says which compaction wrote
+     * it. Only the manifest differs, and it has to be enough on its own to flip the
+     * answer from "the old values" to "the new ones". A fix that merely preferred
+     * the newest sequence number would pass the two tests above and fail this one
+     * for the same reason in reverse.
+     *
+     * <p>It also pins the cleanup: the consumed files are orphans now, and reopening
+     * is what removes them. Without that they accumulate for the life of the store.
+     */
+    @Test
+    void aCrashAfterTheCompactionCommittedKeepsTheNewStructureAndClearsTheOrphans(
+            @TempDir Path root) throws IOException {
+        Path dir = root.resolve("store");
+        int keys = 200;
+
+        try (StrataStore store = StrataStore.open(dir, 8)) {
+            for (int i = 0; i < keys; i++) store.put(key(i), k("old-" + i));
+            store.flush();
+            store.compact();
+        }
+
+        try (StrataStore store = StrataStore.open(dir, 8)) {
+            for (int i = 0; i < keys; i++) store.put(key(i), k("new-" + i));
+            store.flush();
+        }
+        Map<String, byte[]> before = tableFiles(dir);
+
+        try (StrataStore store = StrataStore.open(dir, 8)) {
+            store.compact();
+        }
+        Map<String, byte[]> after = tableFiles(dir);
+        byte[] manifestAfter = manifest(dir);
+
+        Path crashed = crashedDir(root, "crashed-late", before, after, manifestAfter);
+        int filesAtCrash = tableFiles(crashed).size();
+
+        try (StrataStore store = StrataStore.open(crashed, 8)) {
+            for (int i = 0; i < keys; i++) {
+                int at = i;
+                assertArrayEquals(k("new-" + i), store.get(key(i)).orElseThrow(
+                                () -> new AssertionError("key " + at + " vanished after the crash")),
+                        "a committed compaction did not survive the crash for key " + i);
+            }
+        }
+
+        assertEquals(after.size(), tableFiles(crashed).size(),
+                "reopening must delete the tables the committed compaction consumed");
+        assertTrue(filesAtCrash > after.size(),
+                "the crash must have left orphans, or this asserts nothing");
     }
 
     /**
@@ -256,6 +304,32 @@ class StrataCrashConsistencyTest {
             }
         }
         return files;
+    }
+
+    /** The manifest as it stands, which is the record of which of those files count. */
+    private static byte[] manifest(Path dir) throws IOException {
+        return Files.readAllBytes(dir.resolve(Manifest.FILE_NAME));
+    }
+
+    /**
+     * Builds the directory a crash leaves behind: every table file either set has,
+     * and one chosen manifest. Which manifest is the entire question. Before the
+     * compaction commits, the old one is still the store's; after, the new one is.
+     */
+    private static Path crashedDir(Path root, String name, Map<String, byte[]> tablesA,
+                                   Map<String, byte[]> tablesB, byte[] manifest)
+            throws IOException {
+        Path crashed = root.resolve(name);
+        Files.createDirectories(crashed);
+        Map<String, byte[]> union = new HashMap<>(tablesA);
+        union.putAll(tablesB);
+        for (Map.Entry<String, byte[]> e : union.entrySet()) {
+            Files.write(crashed.resolve(e.getKey()), e.getValue());
+        }
+        Files.write(crashed.resolve(Manifest.FILE_NAME), manifest);
+        assertTrue(union.size() > Math.min(tablesA.size(), tablesB.size()),
+                "the compaction must have changed the table set, or this simulates nothing");
+        return crashed;
     }
 
     private static TreeMap<String, String> liveState(StrataStore store) {

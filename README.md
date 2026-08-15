@@ -48,13 +48,15 @@ the hole is named too.
   a delete is not undone by an older table resurfacing. Writing those tests found
   a real bug; see [BUGS.md](docs/BUGS.md).
 
-**Not guaranteed: a crash in the middle of a compaction.** The log recovers from
-anything, but the set of table files does not. A compaction writes its output
-tables and then deletes the tables it consumed, and there is no manifest making
-those two steps atomic, so a crash in between leaves both on disk and a reopen can
-return an overwritten value or a deleted key. This is reproduced, with the failing
-assertion, as STRATA-2 in [BUGS.md](docs/BUGS.md), and the design choice that
-causes it is written up in [DECISIONS.md](docs/DECISIONS.md).
+- **A crash in the middle of a compaction.** A compaction writes its output tables
+  and then deletes the tables it consumed, so a crash in between leaves both sets
+  on disk under valid names. The manifest is what decides which of them is the
+  store, and it is replaced in one atomic rename, so recovery gets the whole of
+  the old set or the whole of the new one and never a mixture of the two.
+  `StrataCrashConsistencyTest` builds that directory by hand and reopens on it,
+  from both sides of the commit. This used to be a real defect that returned
+  overwritten values and resurrected deleted keys; it is written up as STRATA-2 in
+  [BUGS.md](docs/BUGS.md).
 
 ## The write path
 
@@ -104,10 +106,14 @@ the data size and a read touches about one table per level plus the level-0 stac
 A merge keeps the newest value per key and, when it is landing in the deepest
 populated level, discards tombstones.
 
-The name and level of each file are the whole manifest. A table is
-`sst-<level>-<sequence>.sst`, so `open` rebuilds the levels from the directory
-listing alone: the level says which level a table belongs to, and the sequence
-orders the level-0 tables newest first. No separate manifest file is kept.
+A table is `sst-<level>-<sequence>.sst`, and the name carries the shape of the
+level structure: the level says which level a table belongs to, and the sequence
+orders the level-0 tables newest first. What the name cannot say is whether the
+file belongs to the store at all, which is what the `manifest` file records. It
+holds the set of live table names and is replaced by an atomic rename, so the set
+changes in one step. A table file that the manifest does not name is left over
+from a compaction that crashed on one side or the other of its commit, and `open`
+ignores it and deletes it.
 
 This does less work per compaction than a single full merge, so it lowers write
 amplification, and it bounds read amplification. It is an honest simplification of
@@ -248,13 +254,10 @@ Done, the durable write path over a memtable that now spills to disk:
 
 Not done yet:
 
-- **A manifest.** The file names are the whole manifest, so the set of table files
-  is the level structure and there is nothing that changes that set atomically. A
-  clean shutdown is fine; a crash in the middle of a compaction is not, and can
-  return an overwritten value or a deleted key. This is the one place where the
-  store is knowingly not crash safe. Reproduced as STRATA-2 in
-  [BUGS.md](docs/BUGS.md), and the trade that led here is in
-  [DECISIONS.md](docs/DECISIONS.md).
+- **Snapshots and iterators that outlive a compaction.** The manifest makes the
+  live set change atomically, which is what a snapshot would be built on, but
+  nothing keeps an old set pinned so a reader can go on seeing it. A scan holds
+  references to the tables it is walking and that is the whole of it.
 - **Background compaction.** Compaction is leveled now, so it does far less work
   per run, but it still happens on the writer's thread and pauses it while it runs
   rather than moving to a background thread. That is what the gap between p50 and

@@ -1,5 +1,6 @@
 package dev.martinkm.strata;
 
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -314,6 +315,7 @@ class StrataStoreTest {
     }
 
     @Test
+    @Tag("slow") // the single most expensive test in the project
     void formsMultipleLevelsAndMatchesTheModel(@TempDir Path dir) {
         // A small flush threshold and a wide keyspace force many flushes, so level 0
         // fills and merges down repeatedly until several levels exist. Correctness is

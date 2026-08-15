@@ -125,6 +125,23 @@ public final class StrataStore implements Store {
      */
     private final int targetTableEntries;
 
+    /**
+     * Whether {@code put} and {@code delete} fsync the log before returning. True
+     * for every store opened through the ordinary {@link #open} overloads, and the
+     * only setting under which this store is durable. It is false only for
+     * {@link #openWithoutSync}, which exists so a benchmark can price the fsync.
+     */
+    private final boolean fsyncOnWrite;
+
+    /** Key and value bytes handed to this store by callers, the write-amplification denominator. */
+    private long logicalBytesWritten;
+
+    /** Bytes of SSTable written by flushes. */
+    private long flushBytesWritten;
+
+    /** Bytes of SSTable written by compactions. */
+    private long compactionBytesWritten;
+
     private volatile ConcurrentNavigableMap<Bytes, byte[]> memtable = new ConcurrentSkipListMap<>();
     // Tables by level. levels.get(0) is level 0, newest table first. Each deeper level
     // is a run whose tables are sorted by key and hold disjoint ranges. The whole
@@ -133,12 +150,14 @@ public final class StrataStore implements Store {
     private volatile List<List<SSTable>> levels = new ArrayList<>();
     private long nextSeq;
 
-    private StrataStore(Path dir, WriteAheadLog wal, int flushThreshold, int cacheBlocks) {
+    private StrataStore(Path dir, WriteAheadLog wal, int flushThreshold, int cacheBlocks,
+                        boolean fsyncOnWrite) {
         this.dir = dir;
         this.wal = wal;
         this.flushThreshold = flushThreshold;
         this.targetTableEntries = Math.max(1, flushThreshold);
         this.blockCache = new BlockCache(cacheBlocks);
+        this.fsyncOnWrite = fsyncOnWrite;
     }
 
     /** Opens a store at {@code dir} with the default flush threshold and cache size. */
@@ -160,13 +179,29 @@ public final class StrataStore implements Store {
      * useful to tests that want to exercise eviction.
      */
     public static StrataStore open(Path dir, int flushThreshold, int cacheBlocks) {
+        return open(dir, flushThreshold, cacheBlocks, true);
+    }
+
+    /**
+     * Opens a store that appends to the log but never fsyncs it on a write, so a
+     * {@code put} that returned can be lost to a machine crash or a power cut. This
+     * store is <strong>not durable</strong>. It exists so a benchmark can measure
+     * what the fsync in the ordinary write path costs, by running the same workload
+     * with it removed; nothing else should call it.
+     */
+    public static StrataStore openWithoutSync(Path dir, int flushThreshold, int cacheBlocks) {
+        return open(dir, flushThreshold, cacheBlocks, false);
+    }
+
+    private static StrataStore open(Path dir, int flushThreshold, int cacheBlocks,
+                                    boolean fsyncOnWrite) {
         try {
             Files.createDirectories(dir);
         } catch (IOException e) {
             throw new UncheckedIOException("cannot create store directory " + dir, e);
         }
         WriteAheadLog wal = WriteAheadLog.open(dir.resolve("wal.log"));
-        StrataStore store = new StrataStore(dir, wal, flushThreshold, cacheBlocks);
+        StrataStore store = new StrataStore(dir, wal, flushThreshold, cacheBlocks, fsyncOnWrite);
         store.loadSSTables();
         // Replay rebuilds the memtable in write order, so a later put/delete of a
         // key correctly wins over an earlier one. A delete replays as a tombstone,
@@ -189,7 +224,8 @@ public final class StrataStore implements Store {
         // the new value, so a crash can lose a write but never expose one that
         // did not survive.
         wal.append(WriteAheadLog.PUT, key, value);
-        wal.sync();
+        if (fsyncOnWrite) wal.sync();
+        logicalBytesWritten += (long) key.length + value.length;
         memtable.put(Bytes.copyOf(key), value.clone());
         maybeFlush();
     }
@@ -257,7 +293,8 @@ public final class StrataStore implements Store {
     public synchronized void delete(byte[] key) {
         Objects.requireNonNull(key, "key");
         wal.append(WriteAheadLog.DELETE, key, null);
-        wal.sync();
+        if (fsyncOnWrite) wal.sync();
+        logicalBytesWritten += key.length;
         // A tombstone, not a removal: after a flush this marker must remain to
         // shadow any older on-disk value for the same key.
         memtable.put(Bytes.copyOf(key), TOMBSTONE);
@@ -386,6 +423,7 @@ public final class StrataStore implements Store {
 
         Path path = dir.resolve(sstableName(0, nextSeq));
         SSTable.write(path, entries); // fsynced and atomically renamed before it is opened
+        flushBytesWritten += fileSize(path);
         SSTable table = SSTable.open(path, blockCache);
         nextSeq++;
 
@@ -522,6 +560,7 @@ public final class StrataStore implements Store {
                     entries.subList(i, Math.min(i + targetTableEntries, entries.size()));
             Path path = dir.resolve(sstableName(target, nextSeq));
             SSTable.write(path, chunk);
+            compactionBytesWritten += fileSize(path);
             out.add(SSTable.open(path, blockCache));
             nextSeq++;
         }
@@ -533,6 +572,47 @@ public final class StrataStore implements Store {
         wal.close();
         for (List<SSTable> level : levels) {
             for (SSTable table : level) table.close();
+        }
+    }
+
+    /**
+     * What this store has written, in bytes, since it was opened.
+     *
+     * @param logical    key and value bytes handed in by callers
+     * @param wal        framed bytes appended to the write-ahead log, including
+     *                   those a later flush threw away by resetting it
+     * @param flush      SSTable bytes written by memtable flushes
+     * @param compaction SSTable bytes written by compactions
+     */
+    public record IoStats(long logical, long wal, long flush, long compaction) {
+
+        /** Every byte this store put on disk. */
+        public long physical() {
+            return wal + flush + compaction;
+        }
+
+        /**
+         * Write amplification: bytes on disk over bytes the caller wrote. One would
+         * mean the store wrote exactly what it was given, which no log-structured
+         * engine achieves, because the WAL alone writes every value once before a
+         * flush writes it again.
+         */
+        public double writeAmplification() {
+            return logical == 0 ? Double.NaN : (double) physical() / logical;
+        }
+    }
+
+    /** The byte counters behind write amplification. Snapshot, not live. */
+    public synchronized IoStats ioStats() {
+        return new IoStats(logicalBytesWritten, wal.bytesAppended(), flushBytesWritten,
+                compactionBytesWritten);
+    }
+
+    private static long fileSize(Path path) {
+        try {
+            return Files.size(path);
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot size " + path, e);
         }
     }
 

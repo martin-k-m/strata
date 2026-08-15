@@ -120,6 +120,17 @@ final class SSTable {
      */
     record Block(Entry[] entries, long endOffset) {}
 
+    /**
+     * One for the store's own hold on the table, plus one per reader currently
+     * inside it. The file is closed, and deleted if it was retired, when this
+     * reaches zero. See {@link #acquire}.
+     */
+    private final java.util.concurrent.atomic.AtomicInteger refs =
+            new java.util.concurrent.atomic.AtomicInteger(1);
+
+    /** Set by {@link #retire}: this table was compacted away, so its file should go. */
+    private volatile boolean deleteWhenUnused;
+
     private final FileChannel channel;
     private final Path path;
     private final BlockCache cache;
@@ -413,12 +424,70 @@ final class SSTable {
         }
     }
 
+    /**
+     * Takes a reference, or reports that the table is already gone.
+     *
+     * <p>A reader snapshots the level structure and then reads through the tables
+     * it found, and a compaction can retire one of those tables in between. The
+     * reader has no lock to stop it and should not want one, so instead it says
+     * it is using the table, and gets told if it is too late. Too late is not an
+     * error: the table's contents were merged into the new structure before it
+     * was retired, so retaking the snapshot finds them.
+     *
+     * @return false if the last reference has already gone, in which case the
+     *         caller holds nothing and must not read
+     */
+    boolean acquire() {
+        for (; ; ) {
+            int current = refs.get();
+            if (current == 0) {
+                return false;
+            }
+            if (refs.compareAndSet(current, current + 1)) {
+                return true;
+            }
+        }
+    }
+
+    /** Gives back a reference taken by {@link #acquire}, or the store's own. */
+    void release() {
+        if (refs.decrementAndGet() == 0) {
+            closeForGood();
+        }
+    }
+
+    /**
+     * Drops the store's reference and marks the file for deletion, which happens
+     * once the last reader still inside the table has left.
+     *
+     * <p>The alternative, deleting as soon as the table leaves the level
+     * structure, is what this replaced: a reader part way through it then read a
+     * closed channel and got an {@code UncheckedIOException} for a key that was
+     * present the whole time.
+     */
+    void retire() {
+        deleteWhenUnused = true;
+        release();
+    }
+
+    /** Drops the store's reference without deleting anything. For closing the store. */
     void close() {
+        release();
+    }
+
+    private void closeForGood() {
         cache.invalidate(id); // a retired table's blocks must never be served again
         try {
             channel.close();
         } catch (IOException ex) {
             throw new UncheckedIOException("cannot close sstable " + path, ex);
+        }
+        if (deleteWhenUnused) {
+            try {
+                Files.deleteIfExists(path);
+            } catch (IOException ex) {
+                throw new UncheckedIOException("cannot remove compacted sstable " + path, ex);
+            }
         }
     }
 

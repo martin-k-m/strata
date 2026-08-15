@@ -36,10 +36,14 @@ public interface Store extends AutoCloseable {
      * in memory; it holds one entry per layer at a time. The keys and values in the
      * returned entries are fresh copies the caller may keep or mutate.
      *
-     * <p>The scan reads a snapshot of the layers taken when this method is called.
-     * Because it is lazy, it should not run alongside a compaction that closes the
-     * tables underneath it; the store is single-writer, so callers already serialize
-     * against that.
+     * <p>The scan reads a snapshot of the layers taken when this method is called,
+     * and because it is lazy it keeps those layers alive until it is finished with
+     * them. A compaction running underneath it retires its tables without pulling
+     * them away, so the scan still returns the snapshot it started from.
+     *
+     * <p>That holding is what makes closing the stream necessary rather than
+     * merely tidy: a scan left open keeps a compacted table's file on disk. Use it
+     * in a try-with-resources, as with any stream over a file.
      */
     Stream<Map.Entry<byte[], byte[]>> scan(byte[] from, byte[] to);
 

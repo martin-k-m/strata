@@ -41,8 +41,21 @@ public final class WriteAheadLog implements AutoCloseable {
 
     private final FileChannel channel;
 
+    /**
+     * Framed bytes handed to the channel since this log was opened, counting every
+     * append including the ones a later {@link #reset} throws away. It is the WAL
+     * term of the store's write amplification, so it must not be reset when the
+     * file is: the bytes were still written.
+     */
+    private long bytesAppended;
+
     private WriteAheadLog(FileChannel channel) {
         this.channel = channel;
+    }
+
+    /** Framed bytes appended since open, for write-amplification accounting. */
+    public synchronized long bytesAppended() {
+        return bytesAppended;
     }
 
     /** Opens (creating if absent) the log at {@code path}. */
@@ -123,6 +136,7 @@ public final class WriteAheadLog implements AutoCloseable {
         frame.putInt(payloadLen).putInt((int) crc.getValue()).put(payload).flip();
 
         try {
+            bytesAppended += frame.remaining();
             while (frame.hasRemaining()) channel.write(frame);
         } catch (IOException e) {
             throw new UncheckedIOException("write-ahead log append failed", e);

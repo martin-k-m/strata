@@ -1,0 +1,58 @@
+name: Nightly
+
+# The slow suites. Crash fuzzing walks every truncation point and every byte flip
+# of a log, the concurrency properties run readers against a live writer for a
+# fixed wall-clock budget, and the model tests replay thousands of operations
+# against an oracle across several levels. Together they are minutes, not seconds,
+# which is too slow to sit in front of every push, and they are exactly the tests
+# worth running unattended every night.
+#
+# The benchmark job is a smoke test of the harness, not a source of numbers. The
+# figures in docs/BENCHMARKS.md are measured on a named machine and recorded with
+# the command that produced them; a shared CI runner with unknown neighbours and
+# unknown storage cannot reproduce them and should not be quoted as if it could.
+# This job only proves the harness still compiles and runs.
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # 03:00 UTC daily
+  workflow_dispatch:
+
+jobs:
+  slow-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Slow tests
+        run: gradle slowTest --no-daemon --console=plain
+      - name: Publish the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: slow-test-results
+          path: build/reports/tests/
+
+  benchmark-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Compile the harness and run it small
+        run: |
+          gradle compileJava --no-daemon --console=plain
+          mkdir -p build/bench-classes
+          javac -cp build/classes/java/main -d build/bench-classes \
+            bench/java/dev/martinkm/strata/bench/Bench.java
+          java -cp "build/classes/java/main:build/bench-classes" \
+            dev.martinkm.strata.bench.Bench all 2000 "$RUNNER_TEMP/strata-bench"

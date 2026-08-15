@@ -21,6 +21,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -41,7 +42,11 @@ import org.junit.jupiter.api.io.TempDir;
  * memtable, and a compaction, which replaces the level structure and then
  * retires the tables it consumed. Both are driven hard here by a tiny flush
  * threshold, so a short run covers many of each.
+ *
+ * <p>Tagged slow: each test runs threads against a wall-clock budget, so the
+ * class costs minutes. It runs in the nightly workflow, not on every push.
  */
+@Tag("slow")
 class StrataConcurrencyPropertyTest {
 
     /** Long enough to cover many flushes and compactions, short enough to sit in a suite. */

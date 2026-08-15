@@ -113,28 +113,45 @@ code, and no amount of optimisation elsewhere will move it while this policy
 stands. `StrataStore.openWithoutSync` exists only so the benchmark can price it,
 and is documented as not durable.
 
-## The file names are the manifest
+## A manifest file, rather than the file names being the manifest
 
-A table is `sst-<level>-<seq>.sst`, and `open` rebuilds the entire level structure
-from the directory listing: the level says which level a table belongs to and the
-sequence orders the level-0 stack. There is no manifest file. The alternative is
-LevelDB's `MANIFEST` plus `CURRENT`, a log of level-structure edits with a pointer
-to the current one, which is a meaningful amount of machinery.
+The store used to have no manifest. A table is `sst-<level>-<seq>.sst`, the name
+carries the level and the sequence, and that is genuinely enough to rebuild a
+level structure from a directory listing. It made the on-disk state completely
+legible, with no second source of truth to fall out of step with the first, and
+it is the design this project ran with for as long as it was only ever shut down
+cleanly.
 
-Dropping it makes the on-disk state completely legible. Anyone can list the
-directory and know what the store thinks it has, and there is no second source of
-truth to fall out of step with the first.
+It was wrong, and the way it was wrong is worth keeping. The names describe the
+*shape* of the structure and say nothing about *membership*. A compaction is two
+durable steps, write the outputs and then delete the inputs, and a crash in
+between leaves both sets on disk under names that all parse. Recovery then builds
+a level that is supposed to be a disjoint run out of two tables covering the same
+key, one stale and one fresh, and picks between them with a sort on first key
+that knows nothing about which is newer. That is STRATA-2 in [BUGS.md](BUGS.md),
+and it returned overwritten values and resurrected deleted keys.
 
-**This is the compromise with the largest cost in the project, and it is a
-correctness cost, not a performance one.** A compaction is several file
-operations: write the output tables, then delete the inputs. With a manifest,
-those become durable atomically, because the manifest edit that swaps inputs for
-outputs is one record and nothing is visible until it lands. Without one, the file
-set *is* the state, and a crash between the two halves leaves both the inputs and
-the outputs on disk. A reopen then rebuilds a level that is supposed to be a
-disjoint run and finds two tables covering the same key, one stale and one fresh,
-with no record of which is which. See
-[BUGS.md](BUGS.md) for the reproduction and what it actually returns.
+The fix is a `manifest` file holding the set of live table names, replaced by
+writing a temp file, fsyncing it, and renaming it over the old one. The rename is
+the commit. Everything else follows from putting it in the right place: a
+compaction commits after its outputs are written and before its inputs are
+deleted, a flush commits before the log is reset, and a file the manifest does
+not name is not part of the store no matter how complete it is.
+
+The alternative considered was LevelDB's `MANIFEST` plus `CURRENT`, a log of
+edits to the level structure with a pointer to the live one. It lost on size. A
+log of edits earns its keep when the structure is large enough that rewriting the
+whole set per commit costs something, and when you want the edit history for
+other reasons. Here the set is a few dozen names, so writing all of them is
+cheaper than the machinery for writing the difference, and a whole-set file has
+the property that it cannot drift: there is no replay to get wrong.
+
+The cost, stated plainly: the directory is no longer self-describing. `ls` used
+to tell you what the store had, and now it tells you what files exist, of which
+some may be orphans awaiting the next open. The manifest is a second thing that
+can be lost, and losing it is unrecoverable in the sense that the store will not
+guess. A damaged manifest fails the open rather than falling back to the listing,
+because falling back is precisely the behaviour that had the bug.
 
 ## Compaction runs on the writer's thread
 

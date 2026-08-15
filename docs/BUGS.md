@@ -130,8 +130,10 @@ disk forever.
 
 ## STRATA-2: a crash during a compaction resurrects overwritten and deleted keys
 
-**Status:** open. Reproduced, not fixed. The fix needs a manifest; see
-[DECISIONS.md](DECISIONS.md).
+**Status:** fixed in [`39786a4`](https://github.com/martin-k-m/strata/commit/39786a4). A `manifest` file now records the set of live
+tables and is replaced by an atomic rename, so the set changes in one step. See
+[DECISIONS.md](DECISIONS.md) for why the store went without one for as long as it
+did, and what it cost.
 
 ### Symptom
 
@@ -235,13 +237,44 @@ in the directory listing, because the directory listing cannot record intent. Th
 is the actual cost of having no manifest, and it is now written up as such in
 [DECISIONS.md](DECISIONS.md) rather than left as an implied simplification.
 
+### Fix
+
+`Manifest`, a file holding the set of live table names, written as a temp file,
+fsynced, and renamed over the old one. The rename is the commit. `compactionStep`
+commits after writing its outputs and before retiring its inputs, `flush` commits
+before resetting the log, and `open` takes the manifest as the truth: a table file
+the manifest does not name is an orphan from a crash on one side or the other of
+a commit, and it is ignored and deleted. A store with no manifest is one written
+before this existed, so its listing is adopted as the set and committed.
+
+The manifest also carries the sequence counter. Deleting orphans already prevents
+a stale file colliding with a fresh one, but a delete that fails should not be
+able to hand out a sequence number twice, so the counter is taken from the
+manifest rather than from the highest name found on disk.
+
+A damaged manifest fails the open. It does not fall back to the directory
+listing, because the listing is what had the bug.
+
 ### Regression tests
 
-`StrataCrashConsistencyTest.aCrashBetweenCompactionOutputAndInputDeletionKeepsTheNewestValue`
-and `aCrashDuringCompactionDoesNotResurrectADeletedKey`. Both are `@Disabled` with
-a reason pointing here, so the suite stays green while the defect stays visible.
-They are the specification of the fix, and the day a manifest lands, deleting two
-`@Disabled` annotations is how it gets verified.
+`StrataCrashConsistencyTest`, the two tests that were `@Disabled` as the
+specification of this fix and are now enabled:
+`aCrashBetweenCompactionOutputAndInputDeletionKeepsTheNewestValue` and
+`aCrashDuringCompactionDoesNotResurrectADeletedKey`. Both build the crashed
+directory by hand, holding every table file from both sides plus the manifest as
+it stood before the compaction committed.
+
+A third was added with the fix, `aCrashAfterTheCompactionCommittedKeepsTheNew
+StructureAndClearsTheOrphans`, because the two above can be satisfied by the
+wrong thing. The directory is byte for byte the same in both cases and only the
+manifest differs, so a fix that preferred the newest sequence number would pass
+those two and fail this one for the mirror image of the original reason. It also
+pins the orphan cleanup, without which a crashed compaction's output accumulates
+for the life of the store.
+
+The three were checked against a mutant rather than assumed to bite: commenting
+out the commit in `compactionStep` and rerunning the class fails 4 of its 5
+tests.
 
 The other two tests in that class pass and are not disabled:
 

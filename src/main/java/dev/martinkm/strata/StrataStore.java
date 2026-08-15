@@ -434,10 +434,8 @@ public final class StrataStore implements Store {
         levels = updated;
         memtable = new ConcurrentSkipListMap<>();
 
-        // The table is not part of the store until this returns. It has to commit
-        // before the log is dropped: a crash in between recovers a store without the
-        // table and with the log that still holds the same writes, which replays to
-        // the same state. Dropping the log first would lose them.
+        // Before the log is dropped, never after: a crash in between recovers
+        // without the table but with the records that rebuild it.
         commitManifest();
 
         // The memtable's writes now live in the durable table, so the log records
@@ -522,12 +520,8 @@ public final class StrataStore implements Store {
         newTarget.sort(java.util.Comparator.comparing(SSTable::firstKey));
         levels = updated;
 
-        // The commit point of the whole compaction. Before it returns, the outputs
-        // are files on disk that no recovery will read and the inputs are still the
-        // store; after it returns, that is reversed. There is no instant at which a
-        // crash leaves both sets live, which is what used to resurrect an overwritten
-        // key. The input files are still on disk at this point and are now orphans,
-        // which the next open deletes if the loop below does not get there first.
+        // Outputs written, inputs not yet deleted. This is the instant the swap
+        // becomes durable, and there is no other at which both sets are live.
         commitManifest();
 
         // The consumed inputs are out of the level structure now, so no new read
@@ -762,48 +756,34 @@ public final class StrataStore implements Store {
 
         Optional<Manifest.Snapshot> committed = Manifest.read(dir);
 
-        List<Path> paths;
+        // Without a manifest the listing is the only record there is, so it becomes
+        // the set and is committed below. With one, the manifest is the set: anything
+        // else is a crashed compaction's leftovers, and reading it back is STRATA-2.
+        List<Path> paths = onDisk;
         long manifestSeq = -1;
         if (committed.isPresent()) {
-            // The manifest is the set. A table file that is not in it is left over
-            // from a compaction that never committed, or from one that committed and
-            // died before deleting what it consumed. Either way it is not part of the
-            // store, and reading it back is exactly the defect the manifest fixes.
             java.util.Set<String> live = new java.util.HashSet<>(committed.get().names());
             manifestSeq = committed.get().nextSeq();
             paths = new ArrayList<>();
             List<Path> orphans = new ArrayList<>();
             for (Path p : onDisk) {
-                if (live.contains(p.getFileName().toString())) {
-                    paths.add(p);
-                } else {
-                    orphans.add(p);
-                }
+                (live.contains(p.getFileName().toString()) ? paths : orphans).add(p);
             }
             if (paths.size() != live.size()) {
-                java.util.Set<String> found = new java.util.HashSet<>();
-                for (Path p : paths) found.add(p.getFileName().toString());
                 java.util.Set<String> missing = new java.util.TreeSet<>(live);
-                missing.removeAll(found);
+                for (Path p : paths) missing.remove(p.getFileName().toString());
                 throw new UncheckedIOException(new IOException(
                         "the manifest names tables that are not in " + dir + ": " + missing));
             }
-            // Deleting orphans here is what stops a crashed compaction's output from
-            // accumulating forever. It is safe because the manifest has already
-            // decided they are not live, and it happens before any reader exists.
+            // Only once the manifest is known to be satisfiable, so a store that
+            // fails to open still has every file it had.
             for (Path orphan : orphans) {
                 try {
                     Files.deleteIfExists(orphan);
                 } catch (IOException e) {
-                    // A file we are allowed to ignore but not to remove is not a
-                    // reason to refuse to open. It costs disk, not correctness.
+                    // Costs disk, not correctness.
                 }
             }
-        } else {
-            // A store written before manifests existed. The directory listing is the
-            // only record there is, so it is the set, and it gets committed below so
-            // that the next compaction has something to supersede.
-            paths = onDisk;
         }
 
         List<List<SSTable>> loaded = new ArrayList<>();
@@ -826,19 +806,16 @@ public final class StrataStore implements Store {
         }
 
         levels = loaded;
-        // A crashed compaction can leave orphans whose sequence numbers are above
-        // anything live. Those files are deleted above, but taking the manifest's
-        // counter as well means a sequence is never handed out twice even if a
-        // delete failed, so a stale file can never collide with a fresh one.
+        // The manifest's counter as well as the live names, so a delete that failed
+        // cannot leave a stale file for a reused sequence to collide with.
         nextSeq = Math.max(maxSeq + 1, manifestSeq);
 
         if (committed.isEmpty()) commitManifest();
     }
 
     /**
-     * Makes the current set of live tables durable. This is the commit point: until
-     * it returns, tables written since the last commit are files that exist and are
-     * not part of the store, and tables dropped since then are still part of it.
+     * The commit point. Until it returns, tables written since the last commit are
+     * files that exist and are not part of the store, and dropped ones still are.
      */
     private void commitManifest() {
         List<String> names = new ArrayList<>();

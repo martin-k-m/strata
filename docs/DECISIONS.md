@@ -106,9 +106,8 @@ the correctness of the durable path is easier to reason about and to test when
 there is no batching in it.
 
 The cost is enormous and it is the single largest number in the benchmarks.
-Measured on this machine, the fsync is over ninety-eight percent of the time a
-`put` takes; see the fsync table in [BENCHMARKS.md](BENCHMARKS.md) for the exact
-figures. The write throughput of this store is a property of the disk, not of the
+Measured on this machine, the fsync is 99.6% of the time a `put` takes and 249x
+its throughput; see the fsync table in [BENCHMARKS.md](BENCHMARKS.md). The write throughput of this store is a property of the disk, not of the
 code, and no amount of optimisation elsewhere will move it while this policy
 stands. `StrataStore.openWithoutSync` exists only so the benchmark can price it,
 and is documented as not durable.

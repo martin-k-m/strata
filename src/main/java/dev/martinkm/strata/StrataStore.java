@@ -46,6 +46,18 @@ import java.util.stream.StreamSupport;
  * locking, which is why a flush publishes the new table before it clears the
  * memtable, so a key is never briefly absent from both.
  *
+ * <p>Compaction needs the same care in the other direction. It publishes the new
+ * level structure before it retires the tables it consumed, so no read starting
+ * afterwards can find them, but a read that started earlier is already walking
+ * one. Those tables are therefore reference counted: a reader takes a reference
+ * on every table it is about to read and gives it back when it is done, and a
+ * retired table is closed and deleted by whichever of them leaves last. A reader
+ * that arrives just too late to take one retakes its snapshot instead, and finds
+ * the same keys in the tables the compaction wrote.
+ *
+ * <p>{@link #scan} reads its tables lazily, so it holds its references until the
+ * stream is closed. Close it, as with any stream over a file.
+ *
  * <h2>Levels</h2>
  *
  * On-disk tables are organised into levels, which is what keeps a compaction from
@@ -113,6 +125,23 @@ public final class StrataStore implements Store {
      */
     private final int targetTableEntries;
 
+    /**
+     * Whether {@code put} and {@code delete} fsync the log before returning. True
+     * for every store opened through the ordinary {@link #open} overloads, and the
+     * only setting under which this store is durable. It is false only for
+     * {@link #openWithoutSync}, which exists so a benchmark can price the fsync.
+     */
+    private final boolean fsyncOnWrite;
+
+    /** Key and value bytes handed to this store by callers, the write-amplification denominator. */
+    private long logicalBytesWritten;
+
+    /** Bytes of SSTable written by flushes. */
+    private long flushBytesWritten;
+
+    /** Bytes of SSTable written by compactions. */
+    private long compactionBytesWritten;
+
     private volatile ConcurrentNavigableMap<Bytes, byte[]> memtable = new ConcurrentSkipListMap<>();
     // Tables by level. levels.get(0) is level 0, newest table first. Each deeper level
     // is a run whose tables are sorted by key and hold disjoint ranges. The whole
@@ -121,12 +150,14 @@ public final class StrataStore implements Store {
     private volatile List<List<SSTable>> levels = new ArrayList<>();
     private long nextSeq;
 
-    private StrataStore(Path dir, WriteAheadLog wal, int flushThreshold, int cacheBlocks) {
+    private StrataStore(Path dir, WriteAheadLog wal, int flushThreshold, int cacheBlocks,
+                        boolean fsyncOnWrite) {
         this.dir = dir;
         this.wal = wal;
         this.flushThreshold = flushThreshold;
         this.targetTableEntries = Math.max(1, flushThreshold);
         this.blockCache = new BlockCache(cacheBlocks);
+        this.fsyncOnWrite = fsyncOnWrite;
     }
 
     /** Opens a store at {@code dir} with the default flush threshold and cache size. */
@@ -148,13 +179,29 @@ public final class StrataStore implements Store {
      * useful to tests that want to exercise eviction.
      */
     public static StrataStore open(Path dir, int flushThreshold, int cacheBlocks) {
+        return open(dir, flushThreshold, cacheBlocks, true);
+    }
+
+    /**
+     * Opens a store that appends to the log but never fsyncs it on a write, so a
+     * {@code put} that returned can be lost to a machine crash or a power cut. This
+     * store is <strong>not durable</strong>. It exists so a benchmark can measure
+     * what the fsync in the ordinary write path costs, by running the same workload
+     * with it removed; nothing else should call it.
+     */
+    public static StrataStore openWithoutSync(Path dir, int flushThreshold, int cacheBlocks) {
+        return open(dir, flushThreshold, cacheBlocks, false);
+    }
+
+    private static StrataStore open(Path dir, int flushThreshold, int cacheBlocks,
+                                    boolean fsyncOnWrite) {
         try {
             Files.createDirectories(dir);
         } catch (IOException e) {
             throw new UncheckedIOException("cannot create store directory " + dir, e);
         }
         WriteAheadLog wal = WriteAheadLog.open(dir.resolve("wal.log"));
-        StrataStore store = new StrataStore(dir, wal, flushThreshold, cacheBlocks);
+        StrataStore store = new StrataStore(dir, wal, flushThreshold, cacheBlocks, fsyncOnWrite);
         store.loadSSTables();
         // Replay rebuilds the memtable in write order, so a later put/delete of a
         // key correctly wins over an earlier one. A delete replays as a tombstone,
@@ -177,7 +224,8 @@ public final class StrataStore implements Store {
         // the new value, so a crash can lose a write but never expose one that
         // did not survive.
         wal.append(WriteAheadLog.PUT, key, value);
-        wal.sync();
+        if (fsyncOnWrite) wal.sync();
+        logicalBytesWritten += (long) key.length + value.length;
         memtable.put(Bytes.copyOf(key), value.clone());
         maybeFlush();
     }
@@ -189,26 +237,64 @@ public final class StrataStore implements Store {
         // before clearing the memtable, so a key is present in at least one of the
         // two references we read here.
         ConcurrentNavigableMap<Bytes, byte[]> mem = memtable;
-        List<SSTable> tables = readOrder(levels);
+        List<SSTable> tables = hold();
 
-        byte[] fromMem = mem.get(Bytes.wrap(key));
-        if (fromMem != null) {
-            return fromMem == TOMBSTONE ? Optional.empty() : Optional.of(fromMem.clone());
-        }
-        for (SSTable table : tables) { // newest to oldest
-            SSTable.Result r = table.get(key);
-            if (r.isPresent()) {
-                return r.isTombstone() ? Optional.empty() : Optional.of(r.value());
+        try {
+            byte[] fromMem = mem.get(Bytes.wrap(key));
+            if (fromMem != null) {
+                return fromMem == TOMBSTONE ? Optional.empty() : Optional.of(fromMem.clone());
             }
+            for (SSTable table : tables) { // newest to oldest
+                SSTable.Result r = table.get(key);
+                if (r.isPresent()) {
+                    return r.isTombstone() ? Optional.empty() : Optional.of(r.value());
+                }
+            }
+            return Optional.empty();
+        } finally {
+            for (SSTable table : tables) table.release();
         }
-        return Optional.empty();
+    }
+
+    /**
+     * The tables to read, newest first, each with a reference taken so that a
+     * compaction cannot retire it out from under the read.
+     *
+     * <p>The snapshot of {@code levels} and the taking of the references are two
+     * steps, so a compaction can retire a table in between. That shows up as a
+     * failed {@code acquire}, and the answer is to take a fresh snapshot: the
+     * retired table's contents were merged into the new structure before it was
+     * retired, so the newer snapshot has them. Compaction publishes before it
+     * retires, which is what makes retrying converge rather than chase.
+     *
+     * <p>The caller must release every table it is given.
+     */
+    private List<SSTable> hold() {
+        for (; ; ) {
+            List<SSTable> candidates = readOrder(levels);
+            List<SSTable> held = new ArrayList<>(candidates.size());
+            boolean complete = true;
+            for (SSTable table : candidates) {
+                if (table.acquire()) {
+                    held.add(table);
+                } else {
+                    complete = false;
+                    break;
+                }
+            }
+            if (complete) {
+                return held;
+            }
+            for (SSTable table : held) table.release();
+        }
     }
 
     @Override
     public synchronized void delete(byte[] key) {
         Objects.requireNonNull(key, "key");
         wal.append(WriteAheadLog.DELETE, key, null);
-        wal.sync();
+        if (fsyncOnWrite) wal.sync();
+        logicalBytesWritten += key.length;
         // A tombstone, not a removal: after a flush this marker must remain to
         // shadow any older on-disk value for the same key.
         memtable.put(Bytes.copyOf(key), TOMBSTONE);
@@ -220,13 +306,18 @@ public final class StrataStore implements Store {
         // Snapshot the layers the way get() does: a concurrent flush publishes its
         // table before clearing the memtable, so no live key falls between the two.
         ConcurrentNavigableMap<Bytes, byte[]> mem = memtable;
-        List<SSTable> tables = readOrder(levels);
 
         // A reversed or empty range has nothing in it, and the memtable's subMap
         // would reject a reversed one, so answer it directly.
         if (from != null && to != null && Bytes.wrap(from).compareTo(Bytes.wrap(to)) >= 0) {
             return Stream.empty();
         }
+
+        // Held for as long as the stream is being consumed, not just for the call:
+        // a scan reads its tables lazily, so it is inside them until it is closed.
+        // That is why the returned stream must be closed, as every stream over a
+        // file has to be, and why every caller here uses it in a try-with-resources.
+        List<SSTable> tables = hold();
 
         // One source per layer, newest first: the memtable, then the SSTables newest
         // to oldest. Each yields cells in key order, which is what the merge needs.
@@ -240,8 +331,13 @@ public final class StrataStore implements Store {
         Spliterator<MergingIterator.Cell> spliterator = Spliterators.spliteratorUnknownSize(
                 merged, Spliterator.ORDERED | Spliterator.NONNULL);
         return StreamSupport.stream(spliterator, false)
-                .map(cell -> new AbstractMap.SimpleImmutableEntry<byte[], byte[]>(
-                        cell.key().toArray(), cell.value().clone()));
+                // The witness keeps the stream typed as the declared return type
+                // rather than as the concrete entry, so onClose below returns it.
+                .<Map.Entry<byte[], byte[]>>map(cell -> new AbstractMap.SimpleImmutableEntry<>(
+                        cell.key().toArray(), cell.value().clone()))
+                .onClose(() -> {
+                    for (SSTable table : tables) table.release();
+                });
     }
 
     /** The memtable rows in {@code [from, to)} as merge cells, tombstones marked. */
@@ -327,6 +423,7 @@ public final class StrataStore implements Store {
 
         Path path = dir.resolve(sstableName(0, nextSeq));
         SSTable.write(path, entries); // fsynced and atomically renamed before it is opened
+        flushBytesWritten += fileSize(path);
         SSTable table = SSTable.open(path, blockCache);
         nextSeq++;
 
@@ -336,6 +433,10 @@ public final class StrataStore implements Store {
         updated.get(0).add(0, table);
         levels = updated;
         memtable = new ConcurrentSkipListMap<>();
+
+        // Before the log is dropped, never after: a crash in between recovers
+        // without the table but with the records that rebuild it.
+        commitManifest();
 
         // The memtable's writes now live in the durable table, so the log records
         // that carried them are redundant and can be dropped.
@@ -419,15 +520,18 @@ public final class StrataStore implements Store {
         newTarget.sort(java.util.Comparator.comparing(SSTable::firstKey));
         levels = updated;
 
-        // The consumed inputs are unreferenced now; close and remove their files.
-        List<SSTable> consumed = new ArrayList<>(sources);
-        for (SSTable old : consumed) {
-            old.close();
-            try {
-                Files.deleteIfExists(old.path());
-            } catch (IOException e) {
-                throw new UncheckedIOException("cannot remove compacted sstable " + old.path(), e);
-            }
+        // Outputs written, inputs not yet deleted. This is the instant the swap
+        // becomes durable, and there is no other at which both sets are live.
+        commitManifest();
+
+        // The consumed inputs are out of the level structure now, so no new read
+        // will find them. A read that started before the line above may still be
+        // inside one, so this drops the store's own reference and leaves the close
+        // and the delete to whoever leaves last. Closing them here regardless is
+        // what this replaced: a reader part way through a consumed table hit a
+        // closed channel and failed a lookup for a key that never went anywhere.
+        for (SSTable old : new ArrayList<>(sources)) {
+            old.retire();
         }
         return true;
     }
@@ -464,6 +568,7 @@ public final class StrataStore implements Store {
                     entries.subList(i, Math.min(i + targetTableEntries, entries.size()));
             Path path = dir.resolve(sstableName(target, nextSeq));
             SSTable.write(path, chunk);
+            compactionBytesWritten += fileSize(path);
             out.add(SSTable.open(path, blockCache));
             nextSeq++;
         }
@@ -475,6 +580,47 @@ public final class StrataStore implements Store {
         wal.close();
         for (List<SSTable> level : levels) {
             for (SSTable table : level) table.close();
+        }
+    }
+
+    /**
+     * What this store has written, in bytes, since it was opened.
+     *
+     * @param logical    key and value bytes handed in by callers
+     * @param wal        framed bytes appended to the write-ahead log, including
+     *                   those a later flush threw away by resetting it
+     * @param flush      SSTable bytes written by memtable flushes
+     * @param compaction SSTable bytes written by compactions
+     */
+    public record IoStats(long logical, long wal, long flush, long compaction) {
+
+        /** Every byte this store put on disk. */
+        public long physical() {
+            return wal + flush + compaction;
+        }
+
+        /**
+         * Write amplification: bytes on disk over bytes the caller wrote. One would
+         * mean the store wrote exactly what it was given, which no log-structured
+         * engine achieves, because the WAL alone writes every value once before a
+         * flush writes it again.
+         */
+        public double writeAmplification() {
+            return logical == 0 ? Double.NaN : (double) physical() / logical;
+        }
+    }
+
+    /** The byte counters behind write amplification. Snapshot, not live. */
+    public synchronized IoStats ioStats() {
+        return new IoStats(logicalBytesWritten, wal.bytesAppended(), flushBytesWritten,
+                compactionBytesWritten);
+    }
+
+    private static long fileSize(Path path) {
+        try {
+            return Files.size(path);
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot size " + path, e);
         }
     }
 
@@ -601,11 +747,43 @@ public final class StrataStore implements Store {
      * a table sits in and, through its sequence, which of two level-0 tables is newer.
      */
     private void loadSSTables() {
-        List<Path> paths = new ArrayList<>();
+        List<Path> onDisk = new ArrayList<>();
         try (Stream<Path> files = Files.list(dir)) {
-            files.filter(p -> parseName(p.getFileName().toString()) != null).forEach(paths::add);
+            files.filter(p -> parseName(p.getFileName().toString()) != null).forEach(onDisk::add);
         } catch (IOException e) {
             throw new UncheckedIOException("cannot list store directory " + dir, e);
+        }
+
+        Optional<Manifest.Snapshot> committed = Manifest.read(dir);
+
+        // Without a manifest the listing is the only record there is, so it becomes
+        // the set and is committed below. With one, the manifest is the set: anything
+        // else is a crashed compaction's leftovers, and reading it back is STRATA-2.
+        List<Path> paths = onDisk;
+        long manifestSeq = -1;
+        if (committed.isPresent()) {
+            java.util.Set<String> live = new java.util.HashSet<>(committed.get().names());
+            manifestSeq = committed.get().nextSeq();
+            paths = new ArrayList<>();
+            List<Path> orphans = new ArrayList<>();
+            for (Path p : onDisk) {
+                (live.contains(p.getFileName().toString()) ? paths : orphans).add(p);
+            }
+            if (paths.size() != live.size()) {
+                java.util.Set<String> missing = new java.util.TreeSet<>(live);
+                for (Path p : paths) missing.remove(p.getFileName().toString());
+                throw new UncheckedIOException(new IOException(
+                        "the manifest names tables that are not in " + dir + ": " + missing));
+            }
+            // Only once the manifest is known to be satisfiable, so a store that
+            // fails to open still has every file it had.
+            for (Path orphan : orphans) {
+                try {
+                    Files.deleteIfExists(orphan);
+                } catch (IOException e) {
+                    // Costs disk, not correctness.
+                }
+            }
         }
 
         List<List<SSTable>> loaded = new ArrayList<>();
@@ -628,7 +806,23 @@ public final class StrataStore implements Store {
         }
 
         levels = loaded;
-        nextSeq = maxSeq + 1;
+        // The manifest's counter as well as the live names, so a delete that failed
+        // cannot leave a stale file for a reused sequence to collide with.
+        nextSeq = Math.max(maxSeq + 1, manifestSeq);
+
+        if (committed.isEmpty()) commitManifest();
+    }
+
+    /**
+     * The commit point. Until it returns, tables written since the last commit are
+     * files that exist and are not part of the store, and dropped ones still are.
+     */
+    private void commitManifest() {
+        List<String> names = new ArrayList<>();
+        for (List<SSTable> level : levels) {
+            for (SSTable table : level) names.add(table.path().getFileName().toString());
+        }
+        Manifest.write(dir, nextSeq, names);
     }
 
     private long sequenceOf(SSTable table) {

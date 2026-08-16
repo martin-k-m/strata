@@ -1,5 +1,6 @@
 package dev.martinkm.strata;
 
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -59,6 +60,7 @@ class StrataDurabilityPropertyTest {
      * fabricated value and never refuses to open.
      */
     @Test
+    @Tag("slow") // one reopen per byte of the log
     void everyTruncationOfTheLogRecoversAValidPrefix(@TempDir Path dir) throws IOException {
         List<Op> ops = generateOps(new Random(1), 120, 16);
         List<TreeMap<String, String>> snapshots = prefixSnapshots(ops);
@@ -91,6 +93,7 @@ class StrataDurabilityPropertyTest {
      * still lands on a prefix state, never a silently wrong value.
      */
     @Test
+    @Tag("slow") // one reopen per byte of the log
     void anySingleByteCorruptionOfTheLogNeverSurfacesAWrongValue(@TempDir Path dir) throws IOException {
         List<Op> ops = generateOps(new Random(2), 100, 12);
         Set<String> validStates = canonicalize(prefixSnapshots(ops));
@@ -189,6 +192,7 @@ class StrataDurabilityPropertyTest {
      * the oracle exactly.
      */
     @Test
+    @Tag("slow") // 10,000 ops with a flush every 64 and a reopen every 500
     void randomOpsMatchTheOracleAcrossManyReopens(@TempDir Path dir) {
         Random rng = new Random(3);
         TreeMap<String, byte[]> oracle = new TreeMap<>();

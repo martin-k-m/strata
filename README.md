@@ -3,6 +3,7 @@
 [![CI](https://github.com/martin-k-m/strata/actions/workflows/ci.yml/badge.svg)](https://github.com/martin-k-m/strata/actions/workflows/ci.yml)
 [![Java](https://img.shields.io/badge/java-21+-ED8B00?logo=openjdk&logoColor=fff)](https://openjdk.org)
 [![Dependencies](https://img.shields.io/badge/runtime%20dependencies-0-7C6CFF)](build.gradle.kts)
+[![Nightly](https://github.com/martin-k-m/strata/actions/workflows/nightly.yml/badge.svg)](https://github.com/martin-k-m/strata/actions/workflows/nightly.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A log-structured key-value store in Java, built from the write path up.
@@ -11,7 +12,9 @@ A log-structured key-value store in Java, built from the write path up.
 storage engine, the shape of RocksDB, LevelDB and the write path under most of
 the databases you have used. It is written to be read: a small, dependency-free
 core where every durability and ordering decision is visible rather than buried
-in a framework.
+in a framework. The library has no runtime dependencies at all; the only external
+jar in the repository is RocksDB, used by the benchmark source set to compare
+against, and it is not on the library's classpath.
 
 The name is the data structure. An LSM tree keeps data in sorted **layers**:
 a mutable one in memory over a stack of immutable ones on disk, and answers a
@@ -19,14 +22,41 @@ read by looking down through the strata until it finds the key.
 
 ## What it guarantees
 
-- **Durability.** Every `put` and `delete` is appended to a write-ahead log and
-  `fsync`ed before the call returns. A write that returned has survived; a crash
-  can lose only writes still in flight.
-- **Crash recovery.** A process killed at any instant, including mid-append,
-  reopens to a consistent state. Recovery replays the log and truncates a torn
-  trailing record, so a hard kill never leaves a store that refuses to open.
+Each of these names the test that demonstrates it. Where a guarantee has a hole,
+the hole is named too.
+
+- **Durability of the log.** Every `put` and `delete` is appended to a write-ahead
+  log and `fsync`ed before the call returns. A write that returned has survived a
+  power cut; a crash can lose only writes still in flight. Priced in
+  [BENCHMARKS.md](docs/BENCHMARKS.md): the fsync is most of what a `put` costs.
+- **Log recovery, over the whole failure space.** A process killed mid-append
+  reopens to a valid prefix of its write history, and a corrupted log never
+  surfaces a value that was never written.
+  `StrataDurabilityPropertyTest.everyTruncationOfTheLogRecoversAValidPrefix`
+  truncates the log at every byte offset in turn, and
+  `anySingleByteCorruptionOfTheLogNeverSurfacesAWrongValue` flips every byte in
+  turn. Neither ever produces a state that is not a write-history prefix, and
+  neither ever leaves a store that refuses to open.
 - **Ordering.** Keys are held in unsigned-lexicographic order, the same order
-  RocksDB uses, which is what makes ordered scans and, later, compaction cheap.
+  RocksDB uses, which is what makes ordered scans and compaction cheap.
+  `StrataDurabilityPropertyTest.scanOrderIsUnsignedLexicographicEvenForHighBytes`
+  pins it across the high byte range, where a signed comparison silently reverses.
+- **Reads alongside a writer.** Reads take no lock and run correctly while the
+  single writer is flushing and compacting. `StrataConcurrencyPropertyTest` runs
+  readers against a live writer and checks that an acknowledged key is always
+  found with its own value, that a scan completes in order, and that a rewrite or
+  a delete is not undone by an older table resurfacing. Writing those tests found
+  a real bug; see [BUGS.md](docs/BUGS.md).
+
+- **A crash in the middle of a compaction.** A compaction writes its output tables
+  and then deletes the tables it consumed, so a crash in between leaves both sets
+  on disk under valid names. The manifest is what decides which of them is the
+  store, and it is replaced in one atomic rename, so recovery gets the whole of
+  the old set or the whole of the new one and never a mixture of the two.
+  `StrataCrashConsistencyTest` builds that directory by hand and reopens on it,
+  from both sides of the commit. This used to be a real defect that returned
+  overwritten values and resurrected deleted keys; it is written up as STRATA-2 in
+  [BUGS.md](docs/BUGS.md).
 
 ## The write path
 
@@ -76,10 +106,14 @@ the data size and a read touches about one table per level plus the level-0 stac
 A merge keeps the newest value per key and, when it is landing in the deepest
 populated level, discards tombstones.
 
-The name and level of each file are the whole manifest. A table is
-`sst-<level>-<sequence>.sst`, so `open` rebuilds the levels from the directory
-listing alone: the level says which level a table belongs to, and the sequence
-orders the level-0 tables newest first. No separate manifest file is kept.
+A table is `sst-<level>-<sequence>.sst`, and the name carries the shape of the
+level structure: the level says which level a table belongs to, and the sequence
+orders the level-0 tables newest first. What the name cannot say is whether the
+file belongs to the store at all, which is what the `manifest` file records. It
+holds the set of live table names and is replaced by an atomic rename, so the set
+changes in one step. A table file that the manifest does not name is left over
+from a compaction that crashed on one side or the other of its commit, and `open`
+ignores it and deletes it.
 
 This does less work per compaction than a single full merge, so it lowers write
 amplification, and it bounds read amplification. It is an honest simplification of
@@ -102,24 +136,45 @@ With a local JDK 21 and Gradle:
 gradle test
 ```
 
-There is also a small throughput harness. It fills a store with N random keys and
-prints puts, gets that hit, a second get pass over a warm block cache, gets that
-miss and full scans as operations per second.
-It is a timed loop, not JMH, so the numbers are rough magnitudes. Note that every
-put fsyncs the log, so the put rate is bound by the disk, not the code.
+`gradle test` runs the fast suite. The slow ones, the crash fuzzing that walks
+every truncation point and every byte flip of a log, the concurrency properties
+that run readers against a live writer, and the multi-level oracle run, are tagged
+`slow` and run nightly instead of on every push:
 
 ```bash
-gradle bench                 # N defaults to 100000
-gradle bench -Pbench.n=200000
+gradle slowTest
 ```
 
 The tests are the interesting part. Beyond the round trips, `strata` is checked
 against an in-memory `TreeMap` oracle over thousands of random operations, once
 purely in memory and once with a flush threshold small enough that tables spill
-to disk mid-run. A dedicated test corrupts the tail of the log to prove recovery
-truncates it and the store stays writable, and others cover a tombstone
-shadowing an older on-disk value, recovery from SSTables and a log together, and
-a compaction that folds tables down and drops deleted keys.
+to disk mid-run. Others cover a tombstone shadowing an older on-disk value,
+recovery from SSTables and a log together, and a compaction that folds tables down
+and drops deleted keys. The property, crash and concurrency suites are listed
+under [what it guarantees](#what-it-guarantees), each next to the claim it backs.
+
+## Benchmarks
+
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md) has the measurements: write throughput,
+point read latency split by where the key lives, scan throughput, write and space
+amplification, read latency during a compaction against at rest, what the fsync
+costs, and the same workload run against RocksDB on the same machine. It names the
+machine, the JDK and the exact commands, and it reports medians and p99s rather
+than means.
+
+The harness is in [bench/](bench). It needs no JDK, no Gradle and no Maven on the
+machine; `bench/bootstrap.ps1` fetches a JDK and the RocksDB jar into
+`bench/.toolchain` and `bench/run.ps1` compiles and runs a scenario. Through
+Gradle, if you have it:
+
+```bash
+gradle bench                                   # every scenario, n = 50000
+gradle bench -Pbench.scenario=write-amp
+gradle benchRocks                              # the RocksDB comparison
+```
+
+Every put fsyncs the log, so the put rate is bound by the disk rather than by the
+code, and a large `n` is minutes rather than seconds.
 
 ## Command line
 
@@ -199,13 +254,22 @@ Done, the durable write path over a memtable that now spills to disk:
 
 Not done yet:
 
+- **Snapshots and iterators that outlive a compaction.** The manifest makes the
+  live set change atomically, which is what a snapshot would be built on, but
+  nothing keeps an old set pinned so a reader can go on seeing it. A scan holds
+  references to the tables it is walking and that is the whole of it.
 - **Background compaction.** Compaction is leveled now, so it does far less work
   per run, but it still happens on the writer's thread and pauses it while it runs
-  rather than moving to a background thread. Level-0 tables also tend to span the
-  whole key range, so an L0-into-L1 merge still rewrites much of level 1.
+  rather than moving to a background thread. That is what the gap between p50 and
+  max in the write rows of [BENCHMARKS.md](docs/BENCHMARKS.md) is. Level-0 tables
+  also tend to span the whole key range, so an L0-into-L1 merge still rewrites much
+  of level 1. The reference counting that makes reads safe across a compaction is
+  in place, which was the hard half.
 - **Block compression** inside an SSTable. Blocks are checksummed and cached now,
   but they are stored uncompressed, so the on-disk size is the raw key and value
   bytes with no attempt to shrink them.
+- **A byte-budgeted memtable.** The flush threshold is an entry count, so the store
+  does not actually know how much memory the memtable is using.
 
 The `Store` interface above these does not change as they land.
 

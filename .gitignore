@@ -1,5 +1,6 @@
 .gradle/
 build/
+bench/.toolchain/
 !gradle/wrapper/gradle-wrapper.jar
 *.class
 .idea/

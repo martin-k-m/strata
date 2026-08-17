@@ -119,8 +119,8 @@ This does less work per compaction than a single full merge, so it lowers write
 amplification, and it bounds read amplification. It is an honest simplification of
 a real engine, though. Level-0 tables usually span most of the key range, so an
 L0-into-L1 merge still tends to rewrite much of level 1, and the store is still
-single-writer and still pauses the writer for the length of a compaction rather
-than running it in the background.
+single-writer. The merge itself runs on a background thread, so a write pays for
+it only when it outruns the compactor and is stalled.
 
 ## Build and test
 
@@ -258,13 +258,13 @@ Not done yet:
   live set change atomically, which is what a snapshot would be built on, but
   nothing keeps an old set pinned so a reader can go on seeing it. A scan holds
   references to the tables it is walking and that is the whole of it.
-- **Background compaction.** Compaction is leveled now, so it does far less work
-  per run, but it still happens on the writer's thread and pauses it while it runs
-  rather than moving to a background thread. That is what the gap between p50 and
-  max in the write rows of [BENCHMARKS.md](docs/BENCHMARKS.md) is. Level-0 tables
-  also tend to span the whole key range, so an L0-into-L1 merge still rewrites much
-  of level 1. The reference counting that makes reads safe across a compaction is
-  in place, which was the hard half.
+- **Partitioned level-0 tables.** Level-0 tables tend to span the whole key range,
+  so an L0-into-L1 merge still rewrites much of level 1. A real engine limits that
+  with partitioned level-0 tables or a sub-compaction split.
+- **A benchmark run that reflects background compaction.** The numbers in
+  [BENCHMARKS.md](docs/BENCHMARKS.md) were taken with compaction on the writer's
+  thread, so the write rows there, and the reading of `max` as the compaction tax,
+  describe the old shape. They have not been retaken.
 - **Block compression** inside an SSTable. Blocks are checksummed and cached now,
   but they are stored uncompressed, so the on-disk size is the raw key and value
   bytes with no attempt to shrink them.

@@ -243,6 +243,10 @@ class StrataBackgroundCompactionTest {
      * lose a table it names to the compaction that superseded it. That is this
      * helper's problem and not the store's, so it retries until it has a set that
      * hangs together. It converges because the store keeps committing new ones.
+     *
+     * <p>A table can also be briefly unopenable rather than absent, which arrives as
+     * {@code AccessDeniedException} instead of {@code NoSuchFileException}. Both mean
+     * the same thing here, that this attempt did not get a whole set.
      */
     private static Path copyOf(Path dir, Path to) throws IOException {
         for (int attempt = 0; attempt < 50; attempt++) {
@@ -256,7 +260,8 @@ class StrataBackgroundCompactionTest {
                     if (!name.startsWith("sst-") || !name.endsWith(".sst")) continue;
                     try {
                         Files.copy(p, to.resolve(name), StandardCopyOption.REPLACE_EXISTING);
-                    } catch (java.nio.file.NoSuchFileException e) {
+                    } catch (java.nio.file.NoSuchFileException
+                            | java.nio.file.AccessDeniedException e) {
                         whole = false; // retired mid-copy, so this manifest may be stale
                     }
                 }

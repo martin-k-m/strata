@@ -152,20 +152,31 @@ can be lost, and losing it is unrecoverable in the sense that the store will not
 guess. A damaged manifest fails the open rather than falling back to the listing,
 because falling back is precisely the behaviour that had the bug.
 
-## Compaction runs on the writer's thread
+## Compaction runs on its own thread
 
-`flush` and `compact` are called from inside `put`, on whichever thread is
-writing. The alternative, a background compaction thread, is what a real engine
-does and is listed in the README as not done.
+`flush` still runs inside `put`, but the merge does not. A compactor thread plans a
+job under the store's lock, runs the merge with the lock released, and installs the
+result under the lock again. The alternative, which this replaced, was calling
+`compact` from inside `put` on whichever thread happened to be writing.
 
-It has not been built yet because the reference counting that makes reads safe
-across a compaction is the hard part of it, and that is now in place and tested:
-a reader takes a reference on each table it reads, compaction drops the store's
-reference rather than closing the file, and the last one out closes and deletes
-it. Moving the compaction to its own thread is the smaller remaining half.
+The writer's thread was the simpler design and it was the right one for as long as
+the reference counting was missing, because that is the hard half: a reader takes a
+reference on each table it reads, compaction drops the store's reference rather
+than closing the file, and the last one out closes and deletes it. Once that was in
+place and tested, keeping the merge inline was only costing the writer.
 
-The cost until then is the writer's tail latency. A `put` that triggers a flush
-pays for the flush, and a `put` that triggers a compaction pays for the whole
-merge, which shows up directly as the gap between p50 and max in the write rows of
-[BENCHMARKS.md](BENCHMARKS.md). Readers are unaffected, because they never take
-the writer's lock.
+The cost is that a writer can now be stalled rather than paused. When the compactor
+cannot keep up, a writer that is genuinely outrunning it waits instead of queueing,
+because an unbounded queue would let the level-0 stack grow without limit and turn
+a write problem into a read problem. The tail is therefore still there in the worst
+case. It has moved from whichever `put` tripped the trigger to a writer that is
+outrunning the disk.
+
+It also opens a crash window the old design could not reach, because nothing else
+was running: a flush can commit a manifest while a compaction's output tables sit
+on disk unnamed. `StrataBackgroundCompactionTest` samples that window by copying
+the live directory out from under a writer and reopening every copy.
+
+The numbers in [BENCHMARKS.md](BENCHMARKS.md) predate this and have not been
+retaken, so the write rows there, and the reading of `max` as the compaction tax,
+describe the previous shape.

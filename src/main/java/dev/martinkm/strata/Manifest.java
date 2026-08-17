@@ -5,6 +5,7 @@ import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -28,6 +29,11 @@ final class Manifest {
 
     static final String FILE_NAME = "manifest";
     private static final String TEMP_NAME = "manifest.tmp";
+
+    /** Retries of the commit rename, for the Windows sharing case in {@link #commit}. */
+    private static final int COMMIT_ATTEMPTS = 50;
+
+    private static final long COMMIT_RETRY_MILLIS = 20;
     private static final String HEADER = "strata-manifest 1";
     private static final String SEQ_PREFIX = "next-seq ";
     private static final String CRC_PREFIX = "crc ";
@@ -89,14 +95,41 @@ final class Manifest {
                 ch.write(ByteBuffer.wrap(text.toString().getBytes(StandardCharsets.UTF_8)));
                 ch.force(true);
             }
-            Files.move(temp, target, StandardCopyOption.ATOMIC_MOVE,
-                    StandardCopyOption.REPLACE_EXISTING);
+            commit(temp, target);
             syncDirectory(dir);
         } catch (AtomicMoveNotSupportedException e) {
             throw new UncheckedIOException(
                     "the filesystem under " + dir + " cannot rename atomically", e);
         } catch (IOException e) {
             throw new UncheckedIOException("cannot write manifest " + target, e);
+        }
+    }
+
+    /**
+     * Replaces the manifest with the temp file in one step.
+     *
+     * <p>On Windows a rename over a file someone else has open for reading fails with
+     * an access-denied error, where on Linux it succeeds and the reader goes on
+     * reading the file it already has. Anything can be that reader: a backup, an
+     * indexer, a virus scanner, another process looking at the store. The share is
+     * brief, so this retries rather than failing a commit that would have worked a
+     * moment later, and gives up loudly instead of retrying forever.
+     */
+    private static void commit(Path temp, Path target) throws IOException {
+        for (int attempt = 0; ; attempt++) {
+            try {
+                Files.move(temp, target, StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING);
+                return;
+            } catch (AccessDeniedException e) {
+                if (attempt >= COMMIT_ATTEMPTS) throw e;
+                try {
+                    Thread.sleep(COMMIT_RETRY_MILLIS);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
         }
     }
 

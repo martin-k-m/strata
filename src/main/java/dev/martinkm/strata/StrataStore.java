@@ -79,8 +79,31 @@ import java.util.stream.StreamSupport;
  * amplification, and it bounds read amplification to roughly one table per level plus
  * the level-0 stack. It is an honest simplification of a real engine: level 0 tables
  * usually span most of the key range, so an L0 into L1 merge still tends to rewrite
- * much of level 1, and the store is still single-writer and still pauses the writer
- * for the duration of a compaction rather than running it in the background.
+ * much of level 1.
+ *
+ * <h2>Background compaction</h2>
+ *
+ * Compaction runs on its own thread, one per store, so a {@code put} that happens to
+ * cross a level trigger does not pay for the merge. A flush still runs on the
+ * writer's thread, because it is what empties the memtable and the log.
+ *
+ * <p>The compactor plans a job under the store's lock, taking a reference on every
+ * table it will read, then merges and writes its output tables with the lock
+ * released, then installs the result under the lock again. The merge is the long
+ * part and it touches only immutable files, so the writer runs throughout it.
+ * Installing removes exactly the tables the job consumed rather than clearing level
+ * 0 wholesale, because a flush may have added tables to level 0 while the merge ran.
+ *
+ * <p>The commit point is unchanged: the manifest is replaced once, after the output
+ * tables are written and before the inputs are retired, so a crash still recovers to
+ * one set of files or the other. Output tables the manifest does not yet name are
+ * orphans, and {@code open} deletes them.
+ *
+ * <p>When the compactor cannot keep up the writer is stalled rather than queued.
+ * Level 0 above {@link #L0_STALL_TRIGGER} tables blocks {@code put} and
+ * {@code delete} until the compactor brings it back down. There is one compaction in
+ * flight at a time and no queue of pending ones, so the work waiting to be done is
+ * bounded by the level structure itself.
  */
 public final class StrataStore implements Store {
 
@@ -96,6 +119,18 @@ public final class StrataStore implements Store {
 
     /** Level-0 table count that triggers a merge of level 0 into level 1. */
     private static final int L0_COMPACTION_TRIGGER = 4;
+
+    /**
+     * Level-0 table count at which a writer is made to wait for the compactor. Three
+     * times the trigger, so an ordinary burst rides over it and only a writer that is
+     * genuinely outrunning the compactor is stalled. Without this the level-0 stack is
+     * an unbounded queue of work, which trades a latency spike for a store that grows
+     * until it runs out of disk and reads that slow down without limit.
+     */
+    private static final int L0_STALL_TRIGGER = 3 * L0_COMPACTION_TRIGGER;
+
+    /** How long a stalled writer waits before rechecking, so a lost wakeup cannot hang it. */
+    private static final long STALL_POLL_MILLIS = 100;
 
     /** Table budget of level 1. Each level below holds {@link #LEVEL_FANOUT} times more. */
     private static final int LEVEL1_MAX_TABLES = 4;
@@ -148,7 +183,44 @@ public final class StrataStore implements Store {
     // structure is replaced, never mutated in place, so a lockless reader sees a
     // consistent snapshot.
     private volatile List<List<SSTable>> levels = new ArrayList<>();
-    private long nextSeq;
+
+    /**
+     * The next table sequence number. Atomic because the compactor allocates one per
+     * output table while a writer may be allocating one for a flush.
+     */
+    private final java.util.concurrent.atomic.AtomicLong nextSeq =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /** The compaction thread. One per store, started at open and joined by {@link #close}. */
+    private Thread compactor;
+
+    /** Set by {@link #close} to bring the compactor down. Guarded by the store's lock. */
+    private boolean closing;
+
+    /**
+     * Bumped by {@link #compact} to ask for a full drain, and matched by the compactor
+     * once it has nothing left to do. A counter rather than a flag so a caller waits
+     * for its own request rather than for someone else's.
+     */
+    private long drainRequested;
+
+    private long drainCompleted;
+
+    /**
+     * What killed the compactor, if anything. A writer that would otherwise stall
+     * forever behind a dead compactor is given this instead.
+     */
+    private Throwable compactionFailure;
+
+    /** The thread that ran the last compaction, so a test can check it was not the writer's. */
+    private String lastCompactionThread;
+
+    private long compactionsCompleted;
+
+    /** True between planning a job and installing it. Guarded by the store's lock. */
+    private boolean compacting;
+
+    private long writeStalls;
 
     private StrataStore(Path dir, WriteAheadLog wal, int flushThreshold, int cacheBlocks,
                         boolean fsyncOnWrite) {
@@ -187,7 +259,12 @@ public final class StrataStore implements Store {
      * {@code put} that returned can be lost to a machine crash or a power cut. This
      * store is <strong>not durable</strong>. It exists so a benchmark can measure
      * what the fsync in the ordinary write path costs, by running the same workload
-     * with it removed; nothing else should call it.
+     * with it removed.
+     *
+     * <p>The write-stall test is the one other caller, and for a related reason: a
+     * durable writer is slower than the compactor, so it cannot build a backlog, and
+     * the back-pressure policy only fires once the fsync is out of the way. Nothing
+     * that wants its data to survive should call this.
      */
     public static StrataStore openWithoutSync(Path dir, int flushThreshold, int cacheBlocks) {
         return open(dir, flushThreshold, cacheBlocks, false);
@@ -213,7 +290,14 @@ public final class StrataStore implements Store {
                 store.memtable.put(Bytes.wrap(key), TOMBSTONE);
             }
         });
+        store.startCompactor();
         return store;
+    }
+
+    private synchronized void startCompactor() {
+        compactor = new Thread(this::compactorLoop, "strata-compactor-" + dir.getFileName());
+        compactor.setDaemon(true);
+        compactor.start();
     }
 
     @Override
@@ -228,6 +312,7 @@ public final class StrataStore implements Store {
         logicalBytesWritten += (long) key.length + value.length;
         memtable.put(Bytes.copyOf(key), value.clone());
         maybeFlush();
+        awaitCompactionHeadroom();
     }
 
     @Override
@@ -299,6 +384,7 @@ public final class StrataStore implements Store {
         // shadow any older on-disk value for the same key.
         memtable.put(Bytes.copyOf(key), TOMBSTONE);
         maybeFlush();
+        awaitCompactionHeadroom();
     }
 
     @Override
@@ -421,11 +507,10 @@ public final class StrataStore implements Store {
             entries.add(new AbstractMap.SimpleImmutableEntry<>(e.getKey(), value));
         }
 
-        Path path = dir.resolve(sstableName(0, nextSeq));
+        Path path = dir.resolve(sstableName(0, nextSeq.getAndIncrement()));
         SSTable.write(path, entries); // fsynced and atomically renamed before it is opened
         flushBytesWritten += fileSize(path);
         SSTable table = SSTable.open(path, blockCache);
-        nextSeq++;
 
         // Publish the table into level 0 before clearing the memtable, so a concurrent
         // reader always finds each key in one place or the other. Newest first.
@@ -442,45 +527,108 @@ public final class StrataStore implements Store {
         // that carried them are redundant and can be dropped.
         wal.reset();
 
-        maybeCompact();
+        notifyAll(); // level 0 grew, so the compactor may have work
     }
 
     /**
      * Runs compaction to completion, then forces level 0 empty by merging it down
      * even if it has not reached the trigger. It leaves a valid leveled layout, not
-     * a single table. Exposed mainly so tests can drain pending work at a chosen
-     * point; normally {@link #maybeCompact()} drives it off the level triggers.
+     * a single table. The work happens on the compaction thread; this blocks until
+     * that thread has nothing left to do. Exposed mainly so tests and the benchmark
+     * harness can drain pending work at a chosen point.
      */
-    public synchronized void compact() {
-        while (compactionStep(true)) {
-            // keep going until level 0 is empty and no level is over its budget
+    public void compact() {
+        synchronized (this) {
+            long mine = ++drainRequested;
+            notifyAll();
+            while (drainCompleted < mine && !closing) {
+                throwIfCompactionFailed();
+                waitQuietly();
+            }
+            throwIfCompactionFailed();
         }
     }
 
-    /** Runs any compaction the level triggers call for, then stops. */
-    private void maybeCompact() {
-        while (compactionStep(false)) {
-            // one step per iteration until nothing is over its trigger
+    // ------------------------------------------------------------------ compactor
+
+    /** One planned compaction: what it reads, where it writes, and what it may drop. */
+    private record Job(int target, List<SSTable> sources, SSTable picked,
+                       List<SSTable> targetOverlap, boolean dropTombstones) {}
+
+    /** The output of a job: the tables it wrote and what they cost in bytes. */
+    private record Output(List<SSTable> tables, long bytes) {}
+
+    /**
+     * Plans, runs and installs compactions until the store closes.
+     *
+     * <p>The three phases are deliberately separate. Planning and installing hold the
+     * store's lock, because they read and replace the level structure. The merge in
+     * between does not, because it only reads immutable files the plan pinned with a
+     * reference, and it is the part long enough to matter to a writer.
+     */
+    private void compactorLoop() {
+        for (; ; ) {
+            Job job;
+            synchronized (this) {
+                for (; ; ) {
+                    if (closing) return;
+                    long drain = drainRequested;
+                    job = planCompaction(drain > drainCompleted);
+                    if (job != null) {
+                        compacting = true;
+                        break;
+                    }
+                    if (drain > drainCompleted) {
+                        drainCompleted = drain;
+                        notifyAll();
+                        continue; // a drain may have been requested again meanwhile
+                    }
+                    try {
+                        wait();
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                }
+            }
+
+            try {
+                Output output = runJob(job);
+                synchronized (this) {
+                    install(job, output);
+                    notifyAll();
+                }
+            } catch (Throwable t) {
+                synchronized (this) {
+                    abandon(job);
+                    compactionFailure = t;
+                    notifyAll();
+                }
+                return;
+            }
         }
     }
 
     /**
-     * Performs one compaction if a level calls for it and returns whether it did.
+     * Chooses the next compaction and pins the tables it will read, or returns null if
+     * no level calls for one.
      *
      * <p>Level 0 is merged into level 1 when it reaches {@link #L0_COMPACTION_TRIGGER}
      * tables, or unconditionally when {@code forceL0} is set and it is not empty.
      * Otherwise the shallowest level that is over its table budget has one table
-     * merged into the level below it. Either way the inputs are the source tables
-     * plus the tables in the target level that overlap their key range, and the
-     * output is a fresh disjoint run split into tables of about
-     * {@link #targetTableEntries} keys.
+     * merged into the level below it. Either way the inputs are the source tables plus
+     * the tables in the target level that overlap their key range.
+     *
+     * <p>Called with the store's lock held, which is what makes the references safe to
+     * take: every table in {@code levels} is one the store still holds its own
+     * reference to, and only this thread retires one.
      */
-    private boolean compactionStep(boolean forceL0) {
+    private Job planCompaction(boolean forceL0) {
         List<List<SSTable>> snapshot = levels;
-        if (snapshot.isEmpty()) return false;
+        if (snapshot.isEmpty()) return null;
         List<SSTable> level0 = snapshot.get(0);
 
         int target;
+        SSTable picked = null;
         List<SSTable> sources = new ArrayList<>(); // newest first
         List<SSTable> targetOverlap;
 
@@ -490,33 +638,55 @@ public final class StrataStore implements Store {
             targetOverlap = overlapping(levelAt(snapshot, target), keyRange(level0));
         } else {
             int over = shallowestOverBudget(snapshot);
-            if (over < 0) return false;
+            if (over < 0) return null;
             target = over + 1;
             // Pick the table with the smallest first key, a stable, simple choice.
-            SSTable picked = smallestFirstKey(snapshot.get(over));
+            picked = smallestFirstKey(snapshot.get(over));
             sources.add(picked);
             targetOverlap = overlapping(levelAt(snapshot, target), keyRange(List.of(picked)));
         }
         sources.addAll(targetOverlap); // older than every source above
 
+        for (SSTable source : sources) {
+            if (!source.acquire()) {
+                throw new IllegalStateException("a live table was retired under the compactor: "
+                        + source.path());
+            }
+        }
         // A tombstone can be discarded only when it is landing in the deepest level
-        // that still holds data, where nothing older survives for it to shadow.
-        boolean dropTombstones = isDeepestPopulated(snapshot, target);
+        // that still holds data, where nothing older survives for it to shadow. Only
+        // this thread changes the levels below the target, so this stays true until
+        // the job is installed.
+        return new Job(target, sources, picked, targetOverlap,
+                isDeepestPopulated(snapshot, target));
+    }
 
-        List<Map.Entry<Bytes, byte[]>> merged = mergeSources(sources, dropTombstones);
-        List<SSTable> output = writeRun(merged, target);
+    /** The merge and the writes, with the lock released. */
+    private Output runJob(Job job) {
+        List<Map.Entry<Bytes, byte[]>> merged = mergeSources(job.sources(), job.dropTombstones());
+        return writeRun(merged, job.target());
+    }
 
-        // Build the new level structure: drop the consumed tables, add the output run.
-        List<List<SSTable>> updated = copyLevels(snapshot);
+    /**
+     * Swaps the job's inputs for its outputs and commits.
+     *
+     * <p>The consumed tables are removed by identity rather than by clearing level 0,
+     * because a flush may have added tables to level 0 while the merge ran. Those are
+     * newer than everything the job read, and level 0 is newest first, so leaving them
+     * in place at the front is both correct and already in order.
+     */
+    private void install(Job job, Output output) {
+        int target = job.target();
+        List<List<SSTable>> updated = copyLevels(levels);
         while (updated.size() <= target) updated.add(new ArrayList<>());
-        if (target == 1) {
-            updated.get(0).clear(); // the whole of level 0 was merged down
+        if (job.picked() == null) {
+            updated.get(0).removeAll(job.sources()); // only what this job read
         } else {
-            updated.get(target - 1).remove(sources.get(0)); // the single picked table
+            updated.get(target - 1).remove(job.picked());
         }
         List<SSTable> newTarget = updated.get(target);
-        newTarget.removeAll(targetOverlap);
-        newTarget.addAll(output);
+        newTarget.removeAll(job.targetOverlap());
+        newTarget.addAll(output.tables());
         newTarget.sort(java.util.Comparator.comparing(SSTable::firstKey));
         levels = updated;
 
@@ -526,14 +696,89 @@ public final class StrataStore implements Store {
 
         // The consumed inputs are out of the level structure now, so no new read
         // will find them. A read that started before the line above may still be
-        // inside one, so this drops the store's own reference and leaves the close
+        // inside one, so retire drops the store's own reference and leaves the close
         // and the delete to whoever leaves last. Closing them here regardless is
         // what this replaced: a reader part way through a consumed table hit a
         // closed channel and failed a lookup for a key that never went anywhere.
-        for (SSTable old : new ArrayList<>(sources)) {
+        // The second release gives back the reference this job took when it planned.
+        for (SSTable old : job.sources()) {
             old.retire();
+            old.release();
         }
-        return true;
+
+        compactionBytesWritten += output.bytes();
+        compactionsCompleted++;
+        lastCompactionThread = Thread.currentThread().getName();
+        compacting = false;
+    }
+
+    /** True if a level trigger calls for a compaction that has not been planned yet. */
+    private boolean hasPendingCompaction() {
+        List<List<SSTable>> snapshot = levels;
+        return levelAt(snapshot, 0).size() >= L0_COMPACTION_TRIGGER
+                || shallowestOverBudget(snapshot) >= 0;
+    }
+
+    /**
+     * Blocks until the compactor has nothing left that a level trigger calls for.
+     * Unlike {@link #compact} this does not force level 0 down, so it leaves the
+     * structure the triggers produced rather than a drained one. For tests that want
+     * to look at the level structure, which is only stable when the compactor is idle.
+     */
+    synchronized void awaitCompactionIdle() {
+        while (!closing) {
+            throwIfCompactionFailed();
+            if (!compacting && !hasPendingCompaction()) return;
+            notifyAll();
+            waitQuietly(STALL_POLL_MILLIS);
+        }
+    }
+
+    /**
+     * Gives back a failed job's references without installing anything. Its output
+     * tables are files the manifest does not name, so the next open treats them as a
+     * crashed compaction's orphans and deletes them.
+     */
+    private void abandon(Job job) {
+        for (SSTable source : job.sources()) source.release();
+        compacting = false;
+    }
+
+    /**
+     * Blocks a writer while level 0 is above {@link #L0_STALL_TRIGGER}, so the store
+     * pushes back rather than letting the backlog grow without limit. Called with the
+     * lock held, from {@code put} and {@code delete}.
+     */
+    private void awaitCompactionHeadroom() {
+        while (!closing && levelAt(levels, 0).size() >= L0_STALL_TRIGGER) {
+            throwIfCompactionFailed();
+            writeStalls++;
+            notifyAll();
+            waitQuietly(STALL_POLL_MILLIS);
+        }
+    }
+
+    /** Times a writer was made to wait for the compactor. For tests. */
+    synchronized long writeStalls() {
+        return writeStalls;
+    }
+
+    private void throwIfCompactionFailed() {
+        if (compactionFailure == null) return;
+        throw new IllegalStateException("the compaction thread died", compactionFailure);
+    }
+
+    private void waitQuietly() {
+        waitQuietly(0);
+    }
+
+    private void waitQuietly(long millis) {
+        try {
+            wait(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("interrupted waiting for compaction", e);
+        }
     }
 
     /**
@@ -561,25 +806,44 @@ public final class StrataStore implements Store {
     }
 
     /** Writes {@code entries} to level {@code target} as tables of about the target size. */
-    private List<SSTable> writeRun(List<Map.Entry<Bytes, byte[]>> entries, int target) {
+    private Output writeRun(List<Map.Entry<Bytes, byte[]>> entries, int target) {
         List<SSTable> out = new ArrayList<>();
+        long bytes = 0;
         for (int i = 0; i < entries.size(); i += targetTableEntries) {
             List<Map.Entry<Bytes, byte[]>> chunk =
                     entries.subList(i, Math.min(i + targetTableEntries, entries.size()));
-            Path path = dir.resolve(sstableName(target, nextSeq));
+            Path path = dir.resolve(sstableName(target, nextSeq.getAndIncrement()));
             SSTable.write(path, chunk);
-            compactionBytesWritten += fileSize(path);
+            bytes += fileSize(path);
             out.add(SSTable.open(path, blockCache));
-            nextSeq++;
         }
-        return out;
+        return new Output(out, bytes);
     }
 
     @Override
-    public synchronized void close() {
-        wal.close();
-        for (List<SSTable> level : levels) {
-            for (SSTable table : level) table.close();
+    public void close() {
+        Thread thread;
+        synchronized (this) {
+            if (closing) return;
+            closing = true;
+            thread = compactor;
+            notifyAll();
+        }
+        // Not while holding the lock: the compactor needs it to finish installing the
+        // job it may be part way through, and close waits for that rather than
+        // abandoning output the manifest is about to name.
+        if (thread != null) {
+            try {
+                thread.join();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        synchronized (this) {
+            wal.close();
+            for (List<SSTable> level : levels) {
+                for (SSTable table : level) table.close();
+            }
         }
     }
 
@@ -632,6 +896,21 @@ public final class StrataStore implements Store {
     /** Block reads that missed the cache and touched disk since open. For tests. */
     long blockCacheMisses() {
         return blockCache.missCount();
+    }
+
+    /** Compactions installed since open. For tests. */
+    synchronized long compactionsCompleted() {
+        return compactionsCompleted;
+    }
+
+    /** The thread that ran the last compaction, or null if none has. For tests. */
+    synchronized String lastCompactionThread() {
+        return lastCompactionThread;
+    }
+
+    /** The level-0 table count at which a writer is stalled. For tests. */
+    static int stallTrigger() {
+        return L0_STALL_TRIGGER;
     }
 
     /** The number of levels that currently hold at least one table. For tests. */
@@ -741,10 +1020,11 @@ public final class StrataStore implements Store {
     }
 
     /**
-     * Loads existing tables at open, reconstructing the levels from the level and
-     * sequence encoded in each file name. The level and the sequence are the whole
-     * manifest: no separate file is needed, because the name carries both which level
-     * a table sits in and, through its sequence, which of two level-0 tables is newer.
+     * Loads the tables the manifest names, reconstructing the levels from the level
+     * and sequence encoded in each file name. The name says where a table sits and
+     * which of two level-0 tables is newer; the manifest says which tables count at
+     * all, which the names cannot, because a crashed compaction leaves both its inputs
+     * and its outputs under names that parse. See STRATA-2 in docs/BUGS.md.
      */
     private void loadSSTables() {
         List<Path> onDisk = new ArrayList<>();
@@ -808,7 +1088,7 @@ public final class StrataStore implements Store {
         levels = loaded;
         // The manifest's counter as well as the live names, so a delete that failed
         // cannot leave a stale file for a reused sequence to collide with.
-        nextSeq = Math.max(maxSeq + 1, manifestSeq);
+        nextSeq.set(Math.max(maxSeq + 1, manifestSeq));
 
         if (committed.isEmpty()) commitManifest();
     }
@@ -822,7 +1102,7 @@ public final class StrataStore implements Store {
         for (List<SSTable> level : levels) {
             for (SSTable table : level) names.add(table.path().getFileName().toString());
         }
-        Manifest.write(dir, nextSeq, names);
+        Manifest.write(dir, nextSeq.get(), names);
     }
 
     private long sequenceOf(SSTable table) {

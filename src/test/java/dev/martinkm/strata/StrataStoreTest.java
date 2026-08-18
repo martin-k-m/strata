@@ -337,7 +337,10 @@ class StrataStoreTest {
                 }
             }
 
-            // Several levels below level 0 must have formed, not one flat pile.
+            // Several levels below level 0 must have formed, not one flat pile. The
+            // compactor is a separate thread, so let it catch up with the triggers
+            // before looking at the shape it produced.
+            store.awaitCompactionIdle();
             assertTrue(store.deepestLevel() >= 3,
                     "expected several levels, deepest was " + store.deepestLevel());
 
@@ -401,6 +404,9 @@ class StrataStoreTest {
                 oracle.put(key, value);
             }
             store.flush(); // drain the memtable so every live key sits in a table on disk
+            // Compaction runs on its own thread, so the level structure only holds
+            // still once that thread has caught up with the triggers.
+            store.awaitCompactionIdle();
 
             deepest = store.deepestLevel();
             assertTrue(deepest >= 2, "expected several levels, deepest was " + deepest);

@@ -4,6 +4,26 @@ Every number here came out of a run of the harness in [bench/](../bench) on the
 machine described below. The command that produced each table is printed above it.
 Nothing is estimated, extrapolated or copied from anywhere else.
 
+## Read this first: the timing tables predate background compaction
+
+These tables were taken with compaction running on the writer's thread. Background
+compaction landed later, in `61a7c37`, and the timing tables here have not been
+retaken. The byte-accounting tables have, and they still hold exactly.
+
+I re-ran the whole harness to check. What that established:
+
+- **Write amplification and space amplification reproduce byte for byte**, every
+  row, on two separate runs. They are counters rather than clocks, so they do not
+  care about machine load or about which thread compacts. Trust these.
+- **Two timing rows do not reproduce, and one of them is this document's own
+  headline.** They are called out in place below. Trust the shape of the timing
+  tables, not the digits.
+
+The timing numbers are not being rewritten here, because the originals were real
+on an idle machine at the commit they were taken on, and a re-measurement taken
+under different load at a different commit is not a correction of them. It is a
+second observation, and it is recorded as one.
+
 ## Environment
 
 | | |
@@ -251,6 +271,16 @@ continuously and therefore flushing and compacting throughout.
 
 There is a p99 spike and it is 1.5×, 21.0 µs to 31.7 µs. Throughput drops 16%.
 
+> **Does not reproduce: the direction is no longer stable.** One re-run of
+> `bench/run.ps1 compaction-tail 50000` gave 89,030 ops/s at rest against 67,524
+> during compaction, p99 65.3 µs against 123.6 µs, which is a larger spike than the
+> table claims. Three further re-runs in another session had the during-compaction
+> arm *faster* than at rest in one case and slower in two, with no consistent
+> margin. Moving the merge off the writer's thread appears to have turned this into
+> a measurement of whatever else the machine is doing. There is no reproducible 16%
+> drop or 1.5× spike any more, in either direction, and I am not going to quote a
+> number for an effect I cannot re-observe.
+
 What is notable is how small that is. A reader never blocks on the writer, because
 reads take no lock at all: they snapshot the level structure, take a reference on
 each table and read. The degradation here is contention for disk bandwidth and for
@@ -275,6 +305,19 @@ The second configuration is **not durable** and exists only to price the first.
 **The fsync is 249× the throughput and 99.6% of the latency of a `put`.** Of the
 535 µs a durable put takes at p50, 2.2 µs is strata and 533 µs is waiting for the
 disk to say the bytes are safe.
+
+> **Does not reproduce: the 249× does not survive background compaction.** Re-running
+> `bench/run.ps1 fsync 50000` on the same machine gives 781 ops/s durable against
+> 54,960 unsynced, which is **70×**, not 249×. A separate re-run in another session
+> put the unsynced path at roughly 200,000 ops/s, so that arm is heavily
+> load-sensitive and neither re-measurement gets near 403,804. The durable arm is
+> stable; the unsynced arm is what moved. The likely mechanism is
+> `awaitCompactionHeadroom()` in `StrataStore`, which gates every put on compactor
+> headroom and can only bite when the fsync is not already the bottleneck, so it
+> would cost the unsynced arm and be invisible in the durable one. That makes this
+> a candidate performance regression from `61a7c37` rather than only doc drift, and
+> it is not yet bisected. **The conclusion the paragraph draws still holds** at any
+> of these multipliers: the durable p50 is over 99% fsync either way.
 
 This is the single most important number in this document, because it says the
 write throughput of this store is not a property of this code. Every optimisation

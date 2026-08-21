@@ -29,6 +29,11 @@ the hole is named too.
   log and `fsync`ed before the call returns. A write that returned has survived a
   power cut; a crash can lose only writes still in flight. Priced in
   [BENCHMARKS.md](docs/BENCHMARKS.md): the fsync is most of what a `put` costs.
+  Two honest qualifications. No test asserts the sync happens before the return;
+  the guarantee is the `wal.sync()` calls in `StrataStore.put` and `delete`, and
+  what the tests demonstrate is the half after the crash, that whatever was
+  synced recovers. And `StrataStore.openWithoutSync` is public and turns the
+  fsync off, so this guarantee is the default rather than an invariant.
 - **Log recovery, over the whole failure space.** A process killed mid-append
   reopens to a valid prefix of its write history, and a corrupted log never
   surfaces a value that was never written.
@@ -243,8 +248,8 @@ Done, the durable write path over a memtable that now spills to disk:
   sends one table down into the overlapping tables below it. A merge keeps the
   newest value per key and drops a tombstone once it reaches the deepest populated
   level. It does less work per compaction than a full merge, so it lowers write
-  amplification, and the levels persist through the file names so a reopen rebuilds
-  them.
+  amplification, and the level each table belongs to is recorded in the manifest,
+  so a reopen reads the structure rather than inferring it from file names.
 - **Ordered scans.** `scan(from, to)` returns the live pairs with key in
   `[from, to)` in ascending key order, `null` on either bound meaning open on that
   side. It is a k-way merge over one iterator per layer, the memtable and each

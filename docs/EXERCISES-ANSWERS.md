@@ -105,18 +105,24 @@ neither.
 The 8% is format overhead, not garbage: roughly 8 bytes per entry of key and value
 length prefixes, 1.75 bytes per key of sparse index, 1.25 bytes per key of bloom
 filter, and half a byte per key of block header. About 11.5 bytes against a
-116-byte record, a little under 10%. The measured 8% is that and nothing else,
-which is why `compact()` cannot improve it.
+116-byte record, a little under 10%. That 8% is a floor `compact()` can never get
+below, because there is nothing in it to reclaim.
 
-No stale data for two separate reasons. The memtable is a map, so three of every
-four writes to a key (50,000 writes over 12,500 distinct keys) collapse before they
-ever reach disk. And the level-0 trigger of four tables fires early enough that the
-overwrites which do reach disk are merged away quickly.
+The first case has no stale data because nothing has been merged and nothing needs
+to be. The memtable is a map, so three of every four writes to a key (50,000
+writes over 12,500 distinct keys) collapse before they ever reach disk, and with
+the threshold above the level-0 trigger the three tables that result never
+overlap enough to matter.
 
-What it does not establish: an upper bound. The harness never catches the store in
-a state with much garbage in it, so 1.08x is the steady state only. A workload that
-overwrote a large working set between compactions would look worse and this does
-not measure it.
+The second case does have stale data. Ten flushes put the same key in several
+overlapping level-0 and level-1 tables at once, which is 3,842,836 bytes against
+1,450,000 live, or 2.65x. `compact()` merges them and lands on 1,565,040 bytes,
+the same 1.08x floor. Stale data is therefore a function of how far the store is
+from its last compaction, not a property of the format.
+
+What neither establishes: an upper bound. The harness never catches the store with
+a large overwritten working set sitting uncompacted, so 2.65x is the worst it
+happens to observe, not the worst that can happen.
 
 **8. The concurrent-read defect (STRATA-1).**
 

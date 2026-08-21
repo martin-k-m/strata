@@ -37,9 +37,11 @@ them is physically, and say why no compaction strategy can lower either.
 the compaction term from 1.10x to 8.17x, a factor of 7.4. Explain the mechanism
 in terms of the level-0 trigger, and state the trade in one sentence.
 
-**7.** Space amplification is 1.08x and calling `compact()` does not improve it.
-Account for the 8%, and explain why there is no stale data to reclaim. Then say
-what this measurement does *not* establish.
+**7.** Space amplification measures 1.08x with the flush threshold above the
+level-0 trigger, where `compact()` changes nothing, and 2.65x with it below,
+where `compact()` takes it back to 1.08x. Account for the 8% that never goes
+away, explain why the first case has no stale data to reclaim and the second
+does, and say what neither measurement establishes.
 
 **8.** Before the reference-counting fix, a `get` for a key written long ago and
 never touched could throw. Describe the exact interleaving, and explain why

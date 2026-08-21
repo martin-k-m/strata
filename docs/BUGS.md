@@ -207,9 +207,13 @@ StrataCrashConsistencyTest.aCrashDuringCompactionDoesNotResurrectADeletedKey
 110 is `n` and 111 is `o`: the store returned `old-0` for a key last written as
 `new-0`.
 
-### Fix
+### The fix at the time this was written: none
 
-Not written. The correct fix is a manifest: a log of level-structure edits, where
+A manifest was the correct fix and it was not yet built. It is now, in `2b4df0e`;
+see [the fix that landed](#fix-1) below. Keeping the reasoning here because the
+alternatives it rejects are why the manifest looks the way it does.
+
+The correct fix is a manifest: a log of level-structure edits, where
 the record that swaps a compaction's inputs for its outputs is a single durable
 write, so a reopen sees either the old set or the new one and never both. LevelDB
 and RocksDB both do this, with a `MANIFEST` file and a `CURRENT` pointer.
@@ -239,7 +243,7 @@ is the actual cost of having no manifest, and it is now written up as such in
 
 ### Fix
 
-`Manifest`, a file holding the set of live table names, written as a temp file,
+`2b4df0e`. `Manifest`, a file holding the set of live table names, written as a temp file,
 fsynced, and renamed over the old one. The rename is the commit. `compactionStep`
 commits after writing its outputs and before retiring its inputs, `flush` commits
 before resetting the log, and `open` takes the manifest as the truth: a table file
@@ -286,5 +290,7 @@ The other two tests in that class pass and are not disabled:
   data in both places rather than in neither.
 - `restartsInterleavedWithCompactionMatchTheOracle` runs 6,000 operations with a
   flush every 32 and a clean restart every 250, against a `TreeMap` oracle, so the
-  level structure is rebuilt from file names dozens of times over a workload that
-  is compacting throughout.
+  level structure is rebuilt from the manifest dozens of times over a workload that
+  is compacting throughout. It read the structure off the file names when this was
+  written; `2b4df0e` made the manifest the truth, and the test covers the same
+  ground either way.

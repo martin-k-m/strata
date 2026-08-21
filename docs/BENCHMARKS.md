@@ -8,7 +8,9 @@ Nothing is estimated, extrapolated or copied from anywhere else.
 
 These tables were taken with compaction running on the writer's thread. Background
 compaction landed later, in `61a7c37`, and the timing tables here have not been
-retaken. The byte-accounting tables have, and they still hold exactly.
+retaken. The byte-accounting tables have, and they still hold exactly. The fsync
+table's multiplier has since been bisected across that commit and is not a
+regression; see the note under "What the fsync costs".
 
 I re-ran the whole harness to check. What that established:
 
@@ -306,18 +308,36 @@ The second configuration is **not durable** and exists only to price the first.
 535 µs a durable put takes at p50, 2.2 µs is strata and 533 µs is waiting for the
 disk to say the bytes are safe.
 
-> **Does not reproduce: the 249× does not survive background compaction.** Re-running
-> `bench/run.ps1 fsync 50000` on the same machine gives 781 ops/s durable against
-> 54,960 unsynced, which is **70×**, not 249×. A separate re-run in another session
-> put the unsynced path at roughly 200,000 ops/s, so that arm is heavily
-> load-sensitive and neither re-measurement gets near 403,804. The durable arm is
-> stable; the unsynced arm is what moved. The likely mechanism is
-> `awaitCompactionHeadroom()` in `StrataStore`, which gates every put on compactor
-> headroom and can only bite when the fsync is not already the bottleneck, so it
-> would cost the unsynced arm and be invisible in the durable one. That makes this
-> a candidate performance regression from `61a7c37` rather than only doc drift, and
-> it is not yet bisected. **The conclusion the paragraph draws still holds** at any
-> of these multipliers: the durable p50 is over 99% fsync either way.
+> **Does not reproduce, and it is not a regression. Bisected.** Re-running
+> `bench/run.ps1 fsync 50000` never gets near 403,804 unsynced, so the 249× does
+> not reproduce on this machine. I suspected `awaitCompactionHeadroom()` in
+> `StrataStore`, which gates every put on compactor headroom and would cost the
+> unsynced arm while being invisible in the durable one, making background
+> compaction (`61a7c37`) a candidate regression. **Measuring it refutes that.**
+>
+> Three runs at `61a7c37^` (`a99a0c7`, compaction on the writer's thread) against
+> three at `789a16c` (background compaction), alternating, same machine, same
+> invocation, medians reported:
+>
+> | | durable | no fsync | ratio |
+> |---|---:|---:|---:|
+> | `a99a0c7`, before background compaction | 2,077 ops/s | 214,018 ops/s | 103× |
+> | `789a16c`, after | 2,045 ops/s | 206,503 ops/s | 101× |
+>
+> The two are indistinguishable. The unsynced arm is simply high variance: it
+> ranged 199,048 to 312,390 across the three runs at `a99a0c7` and 117,474 to
+> 250,030 at `789a16c`, a spread of about 2.7× *within* a single commit. That
+> spread, not the compaction change, is what separates 403,804 from the numbers
+> above, and the original was taken on a quieter machine than any run here.
+>
+> So the honest reading is that the unsynced arm is not a stable measurement on a
+> machine doing anything else, and the multiplier derived from it inherits that.
+> **The conclusion the paragraph draws still holds** at any of these multipliers:
+> the durable p50 is over 99% fsync either way.
+>
+> Environment for the bisect: Windows 11 10.0 amd64, 16 CPUs, Temurin 21.0.12,
+> heap max 3952 MiB, NVMe, with two idle Docker containers running and nothing
+> else active. Reproduce with `pwsh bench/run.ps1 fsync 50000` at each commit.
 
 This is the single most important number in this document, because it says the
 write throughput of this store is not a property of this code. Every optimisation

@@ -209,19 +209,26 @@ flush.
 | Flush threshold | As it lies | After `compact()` |
 |---|---:|---:|
 | 16,666, three flushes, below the level-0 trigger | 1,564,892 (1.08×) | 1,564,892 (1.08×) |
-| 5,000, ten flushes, level triggers have run | 1,565,040 (1.08×) | 1,565,040 (1.08×) |
+| 5,000, ten flushes, level triggers have run | 3,842,836 (2.65×) | 1,565,040 (1.08×) |
 
-Space amplification is 1.08× and a forced compaction does not improve it, which
-looks wrong until you work out where the 8% goes. It is not stale data. It is
-format overhead: roughly 8 bytes per entry of key and value length prefixes,
-1.75 bytes per key of sparse index, 1.25 bytes per key of bloom filter and half a
-byte per key of block header, which comes to about 11.5 bytes against a 116-byte
-record, or a little under 10%. The measured 8% is that, and nothing else.
+The two rows say different things and the difference is the whole point.
 
-There is no stale data to reclaim for two reasons that are worth separating. The
-memtable is a map, so three of every four writes to a key are collapsed before
-they ever reach disk. And the level-0 trigger of four tables fires early enough
-that overwrites which do reach disk are merged away quickly.
+**Below the level-0 trigger, 1.08× is the floor and `compact()` cannot improve
+it.** Nothing has been merged yet, but nothing needs to be: the memtable is a
+map, so three of every four writes to a key are collapsed before they ever reach
+disk. What is left is not stale data, it is format overhead: roughly 8 bytes per
+entry of key and value length prefixes, 1.75 bytes per key of sparse index, 1.25
+bytes per key of bloom filter and half a byte per key of block header, which
+comes to about 11.5 bytes against a 116-byte record, or a little under 10%. The
+measured 8% is that, and nothing else.
+
+**Once the level triggers have run, the store sits at 2.65× until something
+compacts it.** Ten flushes produce overlapping tables across level 0 and level 1,
+and the same key is resident in several of them at once. That is real stale data
+and `compact()` reclaims all of it, 3,842,836 bytes down to 1,565,040, landing on
+the same 1.08× floor as the first row. So the honest summary is that the floor is
+1.08× and the steady state under a live write load is up to 2.65×, not that space
+amplification is 1.08× everywhere.
 
 The honest limitation: this harness never catches the store in a state with much
 garbage in it, so it does not establish an upper bound on space amplification, only
@@ -337,5 +344,7 @@ scale where any of this mattered.
   row measures an actual disk seek on the read path. The block-cache comparison and
   the RocksDB read rows both understate how much this matters, and a working set
   above 15 GiB is the obvious next thing to measure.
-- **An upper bound on space amplification.** The steady state is 1.08×; the
-  worst case is not established.
+- **An upper bound on space amplification.** The compacted floor is 1.08× and the
+  measured steady state under a live write load is 2.65×; the worst case is not
+  established, because the harness never catches the store with a large
+  overwritten working set sitting uncompacted.

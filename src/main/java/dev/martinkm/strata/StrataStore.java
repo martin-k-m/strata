@@ -117,8 +117,31 @@ public final class StrataStore implements Store {
     /** Default flush threshold: memtable entries before a spill to disk. */
     private static final int DEFAULT_FLUSH_THRESHOLD = 100_000;
 
-    /** Level-0 table count that triggers a merge of level 0 into level 1. */
-    private static final int L0_COMPACTION_TRIGGER = 4;
+    /**
+     * Slices a flush is split into, and so the number of level-0 tables it writes.
+     *
+     * <p>A flush used to write one table covering whatever range the memtable
+     * touched, which for most workloads is most of the store; an L0 into L1 merge
+     * then overlapped most of level 1 and rewrote it. Splitting the flush gives
+     * level 0 tables with narrow ranges, so the compactor can take a group of them
+     * covering part of the key space and leave the rest of level 1 alone.
+     *
+     * <p>Four rather than a size in entries, and that is a correction rather than
+     * a preference: the first version of this split on {@code targetTableEntries},
+     * which is the flush threshold, and a flush happens AT the threshold, so the
+     * memtable was always one slice and the partitioning did nothing at all. A
+     * fixed count cannot be defeated that way by the threshold a caller chooses.
+     */
+    private static final int L0_FLUSH_PARTITIONS = 4;
+
+    /**
+     * Level-0 table count that triggers a merge of level 0 into level 1.
+     *
+     * <p>Scaled by {@link #L0_FLUSH_PARTITIONS} so it still means "about four
+     * flushes". Left at four it would mean one flush, and every flush would
+     * trigger a compaction.
+     */
+    private static final int L0_COMPACTION_TRIGGER = 4 * L0_FLUSH_PARTITIONS;
 
     /**
      * Level-0 table count at which a writer is made to wait for the compactor. Three
@@ -680,15 +703,35 @@ public final class StrataStore implements Store {
             entries.add(new AbstractMap.SimpleImmutableEntry<>(e.getKey(), value));
         }
 
-        Path path = dir.resolve(sstableName(0, nextSeq.getAndIncrement()));
-        SSTable.write(path, entries); // fsynced and atomically renamed before it is opened
-        flushBytesWritten += fileSize(path);
-        SSTable table = SSTable.open(path, blockCache);
+        // PARTITIONED LEVEL 0. The memtable is written as several tables split on
+        // key rather than as one, each covering a contiguous slice of the sorted
+        // entries and so a narrow key range.
+        //
+        // The reason is what an L0 into L1 merge costs. Level-0 tables come
+        // straight from the memtable, so an unpartitioned one spans whatever range
+        // the workload touched, which is usually most of the store; the merge then
+        // overlaps most of level 1 and rewrites it. Narrow L0 tables let the
+        // compactor take a subset of level 0 whose range covers a subset of level
+        // 1, which is the write amplification this addresses.
+        //
+        // The slices are disjoint and written newest-first into level 0 together.
+        // Within one flush their order does not matter, because no key appears in
+        // two of them; across flushes the newest flush still sits in front.
+        int perSlice = Math.max(1, (entries.size() + L0_FLUSH_PARTITIONS - 1) / L0_FLUSH_PARTITIONS);
+        List<List<Map.Entry<Bytes, byte[]>>> slices = partition(entries, perSlice);
+        List<SSTable> fresh = new ArrayList<>(slices.size());
+        for (List<Map.Entry<Bytes, byte[]>> slice : slices) {
+            Path path = dir.resolve(sstableName(0, nextSeq.getAndIncrement()));
+            SSTable.write(path, slice); // fsynced and atomically renamed before it is opened
+            flushBytesWritten += fileSize(path);
+            fresh.add(SSTable.open(path, blockCache));
+        }
 
-        // Publish the table into level 0 before clearing the memtable, so a concurrent
-        // reader always finds each key in one place or the other. Newest first.
+        // Publish the tables into level 0 before clearing the memtable, so a
+        // concurrent reader always finds each key in one place or the other.
+        // Newest first.
         List<List<SSTable>> updated = copyLevels(levels);
-        updated.get(0).add(0, table);
+        updated.get(0).addAll(0, fresh);
         levels = updated;
         memtable = new ConcurrentSkipListMap<>();
         memtableBytes = 0;
@@ -808,8 +851,24 @@ public final class StrataStore implements Store {
 
         if (level0.size() >= L0_COMPACTION_TRIGGER || (forceL0 && !level0.isEmpty())) {
             target = 1;
-            sources.addAll(level0); // already newest first
-            targetOverlap = overlapping(levelAt(snapshot, target), keyRange(level0));
+            // Not all of level 0: the tables whose ranges connect to the narrowest
+            // one, and only those. With partitioned flushes an L0 table covers a
+            // slice rather than the whole store, so this takes a group covering
+            // part of the key space and overlaps part of level 1 instead of all of
+            // it.
+            //
+            // CLOSED UNDER OVERLAP, which is the part that has to be right. A table
+            // is consumed whole, so every key it holds must have all its other
+            // versions in the same job: if an older value were merged into level 1
+            // while a newer one stayed in level 0, a read would find the older
+            // first at the shallower level and answer with it. So the group grows
+            // until no table outside it overlaps its range, and the range used
+            // against level 1 is the union of the group rather than of the seed.
+            // When every L0 table spans everything the closure is all of level 0
+            // and this degrades to exactly what it did before.
+            List<SSTable> group = l0Group(level0);
+            sources.addAll(group); // level0 order, so newest first
+            targetOverlap = overlapping(levelAt(snapshot, target), keyRange(group));
         } else {
             int over = shallowestOverBudget(snapshot);
             if (over < 0) return null;
@@ -884,6 +943,130 @@ public final class StrataStore implements Store {
         compactionsCompleted++;
         lastCompactionThread = Thread.currentThread().getName();
         compacting = false;
+    }
+
+    /**
+     * Splits sorted entries into contiguous slices of at most {@code perTable}.
+     *
+     * <p>Contiguous and in order, so each slice holds a disjoint key range and the
+     * slices together are the whole memtable. A single slice is returned when the
+     * memtable is small enough, which is what a flush did before this existed.
+     */
+    private static List<List<Map.Entry<Bytes, byte[]>>> partition(
+            List<Map.Entry<Bytes, byte[]>> entries, int perTable) {
+        int size = Math.max(1, perTable);
+        if (entries.size() <= size) return List.of(entries);
+        List<List<Map.Entry<Bytes, byte[]>>> slices = new ArrayList<>();
+        for (int from = 0; from < entries.size(); from += size) {
+            slices.add(entries.subList(from, Math.min(from + size, entries.size())));
+        }
+        return slices;
+    }
+
+    /**
+     * The level-0 tables one compaction should take: a key-adjacent group, closed
+     * under overlap, big enough to be worth doing.
+     *
+     * <p>The closure alone is not enough, and the reason is worth recording
+     * because the first version of this shipped without it and broke a test that
+     * had nothing to do with partitioning. Flushes are partitioned on key, so with
+     * a workload that writes keys in order the level-0 tables are largely
+     * DISJOINT: the narrowest one overlaps nothing, the closure is a single table,
+     * and each compaction moves one small table into level 1. Level 0 then drains
+     * one table per job while flushes add four, so it never shrinks, nothing is
+     * reclaimed, and the store grows without bound. A test that held a scan across
+     * a writer's compactions caught it as 752 files before and 752 after.
+     *
+     * <p>So the group grows by key adjacency until it is worth a job. Starting
+     * from the narrowest table it repeatedly takes the nearest unchosen table in
+     * key order and re-closes, which keeps the range compact, which is the whole
+     * point: a narrow range overlaps few level-1 tables. It stops at the
+     * compaction trigger, so a job consumes about as many tables as a trigger's
+     * worth, and it can stop earlier only by running out of level 0.
+     */
+    private List<SSTable> l0Group(List<SSTable> level0) {
+        int want = Math.min(L0_COMPACTION_TRIGGER, level0.size());
+        List<SSTable> group = overlapClosure(level0, narrowest(level0));
+        while (group.size() < want) {
+            Bytes[] range = keyRange(group);
+            SSTable nearest = null;
+            java.math.BigInteger best = null;
+            for (SSTable t : level0) {
+                if (group.contains(t)) continue;
+                // Distance from the group's range, zero if it touches.
+                java.math.BigInteger d = distanceFrom(range, t);
+                if (best == null || d.compareTo(best) < 0) {
+                    best = d;
+                    nearest = t;
+                }
+            }
+            if (nearest == null) break;
+            List<SSTable> grown = new ArrayList<>(group);
+            grown.add(nearest);
+            group = overlapClosure(level0, grown);
+        }
+        return group;
+    }
+
+    /** How far {@code t} sits outside {@code range}, or zero if it intersects it. */
+    private static java.math.BigInteger distanceFrom(Bytes[] range, SSTable t) {
+        java.math.BigInteger lo = new java.math.BigInteger(1, range[0].toArray());
+        java.math.BigInteger hi = new java.math.BigInteger(1, range[1].toArray());
+        java.math.BigInteger first = new java.math.BigInteger(1, t.firstKey().toArray());
+        java.math.BigInteger last = new java.math.BigInteger(1, t.lastKey().toArray());
+        if (last.compareTo(lo) < 0) return lo.subtract(last);
+        if (first.compareTo(hi) > 0) return first.subtract(hi);
+        return java.math.BigInteger.ZERO;
+    }
+
+    /** The table with the narrowest key range, as a seed for the closure below. */
+    private SSTable narrowest(List<SSTable> tables) {
+        SSTable best = tables.get(0);
+        java.math.BigInteger bestWidth = null;
+        for (SSTable t : tables) {
+            java.math.BigInteger width = new java.math.BigInteger(1, t.lastKey().toArray())
+                    .subtract(new java.math.BigInteger(1, t.firstKey().toArray())).abs();
+            if (bestWidth == null || width.compareTo(bestWidth) < 0) {
+                best = t;
+                bestWidth = width;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * Every table reachable from {@code seed} by overlapping key ranges, in the
+     * order they appear in {@code tables}.
+     *
+     * <p>Grown to a fixed point rather than in one pass: adding a table widens the
+     * range, which can bring in a table that did not overlap the seed. Stopping
+     * early would consume a table holding keys whose other versions stayed behind,
+     * and level 0 is the one level where two tables may hold the same key.
+     */
+    private List<SSTable> overlapClosure(List<SSTable> tables, SSTable seed) {
+        return overlapClosure(tables, List.of(seed));
+    }
+
+    private List<SSTable> overlapClosure(List<SSTable> tables, List<SSTable> seeds) {
+        java.util.Set<SSTable> chosen = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        chosen.addAll(seeds);
+        boolean grew = true;
+        while (grew) {
+            grew = false;
+            Bytes[] range = keyRange(new ArrayList<>(chosen));
+            for (SSTable t : tables) {
+                if (chosen.contains(t)) continue;
+                if (t.firstKey().compareTo(range[1]) <= 0 && t.lastKey().compareTo(range[0]) >= 0) {
+                    chosen.add(t);
+                    grew = true;
+                }
+            }
+        }
+        List<SSTable> ordered = new ArrayList<>(chosen.size());
+        for (SSTable t : tables) {
+            if (chosen.contains(t)) ordered.add(t);
+        }
+        return ordered;
     }
 
     /** True if a level trigger calls for a compaction that has not been planned yet. */

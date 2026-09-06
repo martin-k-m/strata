@@ -250,6 +250,20 @@ Done, the durable write path over a memtable that now spills to disk:
   level. It does less work per compaction than a full merge, so it lowers write
   amplification, and the level each table belongs to is recorded in the manifest,
   so a reopen reads the structure rather than inferring it from file names.
+- **Block compression.** Each data block is deflated, and the codec is chosen
+  **per block**: the writer keeps whichever of the raw and deflated forms is
+  smaller and records which in the block header, so a block that does not
+  compress is stored as it was. Repetitive values shrink by more than four times
+  on disk; a block that cannot compress is never stored larger than its raw
+  bytes, which is the invariant the per-block choice exists to make.
+
+  The checksum covers the **stored** bytes rather than the decoded ones, so bit
+  rot is caught before the inflater is handed damaged input and a corrupt codec
+  byte surfaces as a `ChecksumException` naming the table and offset rather than
+  as a zlib complaint. The format marker is `STRATA3`; a `STRATA2` table is a
+  different format and `open` rejects it, the same way `STRATA2` rejected
+  `STRATA1`.
+
 - **A byte-budgeted memtable.** `openWithMemoryBudget(dir, entries, bytes)`
   flushes when the memtable's estimated heap reaches the budget, or when the
   entry threshold is reached, whichever comes first. An entry count alone bounds
@@ -294,13 +308,17 @@ Not done yet:
 - **Partitioned level-0 tables.** Level-0 tables tend to span the whole key range,
   so an L0-into-L1 merge still rewrites much of level 1. A real engine limits that
   with partitioned level-0 tables or a sub-compaction split.
-- **A benchmark run that reflects background compaction.** The numbers in
-  [BENCHMARKS.md](docs/BENCHMARKS.md) were taken with compaction on the writer's
-  thread, so the write rows there, and the reading of `max` as the compaction tax,
-  describe the old shape. They have not been retaken.
-- **Block compression** inside an SSTable. Blocks are checksummed and cached now,
-  but they are stored uncompressed, so the on-disk size is the raw key and value
-  bytes with no attempt to shrink them.
+- **A benchmark run that reflects background compaction, on the machine the
+  originals were taken on.** The numbers in [BENCHMARKS.md](docs/BENCHMARKS.md)
+  were taken with compaction on the writer's thread, so the write rows there, and
+  the reading of `max` as the compaction tax, describe the old shape. The harness
+  *has* been re-run since: byte accounting reproduces row for row, and the two
+  timing rows that do not are called out in place. What is missing is a re-take on
+  the same hardware, which is the only thing that would let the digits be compared
+  rather than merely replaced. That document's own argument is the reason it has
+  not been done elsewhere: a re-measurement under different load at a different
+  commit is a second observation, not a correction.
+
 
 
 The `Store` interface above these does not change as they land. `snapshot()` is

@@ -17,6 +17,9 @@ import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.zip.CRC32;
+import java.util.zip.DataFormatException;
+import java.util.zip.Deflater;
+import java.util.zip.Inflater;
 
 /**
  * An immutable, sorted on-disk table: one flushed generation of the memtable.
@@ -30,8 +33,13 @@ import java.util.zip.CRC32;
  *
  * <pre>
  *   data:   [block]...                        every key, in sorted order, grouped into blocks
- *             block = [payloadLen: int][crc32: int][entry...]
- *                     crc32 is over the payload; a block holds up to INDEX_INTERVAL entries
+ *             block = [storedLen: int][crc32: int][codec: byte][rawLen: int][stored...]
+ *                     crc32 is over everything after it, so it covers the codec
+ *                     byte and the stored bytes as they sit on disk rather than
+ *                     what they decode to; a block holds up to INDEX_INTERVAL
+ *                     entries. codec 0 is raw and codec 1 is deflate, chosen per
+ *                     block by whichever is smaller, so a block that does not
+ *                     compress is never stored larger than its raw bytes.
  *             entry = [keyLen: int][key][valLen: int][value]
  *                     valLen = -1 marks a tombstone (a delete), which carries no value
  *   index:  [entry]...                        one entry per data block
@@ -65,10 +73,75 @@ final class SSTable {
     /** Value length written for a tombstone. A real value is never negative length. */
     private static final int TOMBSTONE_LEN = -1;
 
-    // The magic doubles as a format version. STRATA2 is the block-checksummed layout;
-    // a STRATA1 table (unblocked, no per-block checksum) is a different format and is
+    // The magic doubles as a format version. STRATA3 is the block-compressed
+    // layout; STRATA2 (blocked and checksummed, stored raw) and STRATA1
+    // (unblocked, no per-block checksum) are different formats and are
     // rejected by open() rather than misread.
-    private static final long MAGIC = 0x53545241544132L; // "STRATA2"
+    private static final long MAGIC = 0x53545241544133L; // "STRATA3"
+
+    /**
+     * Block codecs. The byte is stored inside the checksummed region, so a codec
+     * that arrives corrupted is caught as a checksum failure rather than as a
+     * decompression one.
+     */
+    private static final byte CODEC_NONE = 0;
+
+    private static final byte CODEC_DEFLATE = 1;
+
+    /**
+     * A block is compressed only if compressing it made it smaller.
+     *
+     * <p>Compression is not free and it is not always a win: a block of
+     * already-compressed values, or of high-entropy keys, comes out of the
+     * deflater larger than it went in, and storing that would make the file
+     * bigger to no end. So each block records which codec was used and the writer
+     * picks per block. An incompressible table is the same size it was before
+     * this existed, plus five bytes a block.
+     */
+    private static byte[] deflate(byte[] raw) {
+        Deflater deflater = new Deflater(Deflater.DEFAULT_COMPRESSION, true);
+        try {
+            deflater.setInput(raw);
+            deflater.finish();
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(raw.length);
+            byte[] chunk = new byte[Math.max(64, Math.min(raw.length, 8192))];
+            while (!deflater.finished()) {
+                int n = deflater.deflate(chunk);
+                if (n == 0 && deflater.needsInput()) break;
+                out.write(chunk, 0, n);
+            }
+            return out.toByteArray();
+        } finally {
+            deflater.end();
+        }
+    }
+
+    private static byte[] inflate(byte[] stored, int rawLength, Path path, long offset) {
+        Inflater inflater = new Inflater(true);
+        try {
+            inflater.setInput(stored);
+            byte[] raw = new byte[rawLength];
+            int filled = 0;
+            while (filled < rawLength) {
+                int n = inflater.inflate(raw, filled, rawLength - filled);
+                if (n == 0) {
+                    if (inflater.finished() || inflater.needsInput()) break;
+                }
+                filled += n;
+            }
+            if (filled != rawLength) {
+                // The checksum passed, so the bytes are the bytes that were
+                // written; a short inflate here means the block was written by
+                // something that disagrees with this reader about the format.
+                throw new ChecksumException(path, offset);
+            }
+            return raw;
+        } catch (DataFormatException e) {
+            throw new ChecksumException(path, offset);
+        } finally {
+            inflater.end();
+        }
+    }
     private static final int FOOTER_LEN = 8 + 8 + 4 + 8 + 4 + 8;
 
     /** Assigns each opened table a distinct identity, used to key its blocks in the cache. */
@@ -536,13 +609,29 @@ final class SSTable {
         int payloadLen = header.getInt();
         int expectedCrc = header.getInt();
 
-        ByteBuffer payload = readAt(ch, offset + 8, payloadLen);
-        payload.flip();
+        ByteBuffer region = readAt(ch, offset + 8, payloadLen);
+        region.flip();
         CRC32 crc = new CRC32();
-        crc.update(payload.duplicate());
+        crc.update(region.duplicate());
         if ((int) crc.getValue() != expectedCrc) {
             throw new ChecksumException(path, offset);
         }
+
+        byte codec = region.get();
+        int rawLen = region.getInt();
+        byte[] storedBytes = new byte[region.remaining()];
+        region.get(storedBytes);
+        byte[] rawBytes;
+        if (codec == CODEC_DEFLATE) {
+            rawBytes = inflate(storedBytes, rawLen, path, offset);
+        } else if (codec == CODEC_NONE) {
+            rawBytes = storedBytes;
+        } else {
+            // Passed the checksum, so these are the bytes that were written, by a
+            // writer this reader does not understand.
+            throw new ChecksumException(path, offset);
+        }
+        ByteBuffer payload = ByteBuffer.wrap(rawBytes);
 
         List<Entry> entries = new ArrayList<>();
         while (payload.hasRemaining()) {
@@ -573,12 +662,27 @@ final class SSTable {
 
     /** Writes one block ([len][crc][payload]) and returns the bytes it occupies. */
     private static long writeBlock(FileChannel ch, byte[] payload) throws IOException {
+        // The stored region is [codec][rawLen][bytes], and the checksum covers all
+        // of it. Checksumming what is actually on disk rather than what it decodes
+        // to is the point: bit rot is caught before the inflater is handed the
+        // damaged bytes, and a corrupt codec byte is a checksum failure rather
+        // than an unexplained decompression one.
+        byte[] compressed = deflate(payload);
+        boolean useDeflate = compressed.length < payload.length;
+        byte[] stored = useDeflate ? compressed : payload;
+        byte codec = useDeflate ? CODEC_DEFLATE : CODEC_NONE;
+
+        int storedLen = 1 + 4 + stored.length;
+        ByteBuffer region = ByteBuffer.allocate(storedLen);
+        region.put(codec).putInt(payload.length).put(stored).flip();
+
         CRC32 crc = new CRC32();
-        crc.update(payload);
-        ByteBuffer buf = ByteBuffer.allocate(8 + payload.length);
-        buf.putInt(payload.length).putInt((int) crc.getValue()).put(payload).flip();
+        crc.update(region.duplicate());
+
+        ByteBuffer buf = ByteBuffer.allocate(8 + storedLen);
+        buf.putInt(storedLen).putInt((int) crc.getValue()).put(region).flip();
         writeFully(ch, buf);
-        return 8L + payload.length;
+        return 8L + storedLen;
     }
 
     private static void writeFully(FileChannel ch, ByteBuffer buf) throws IOException {

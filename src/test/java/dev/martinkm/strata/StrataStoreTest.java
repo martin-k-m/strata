@@ -514,11 +514,28 @@ class StrataStoreTest {
         }
     }
 
-    /** The single SSTable file in {@code dir}, for tests that poke at the bytes on disk. */
+    /**
+     * The largest SSTable file in {@code dir}, for tests that poke at the bytes on
+     * disk.
+     *
+     * <p>This asked for the only table and asserted there was exactly one, which
+     * was true when a flush wrote a single table. A flush is partitioned across
+     * several tables now, so it takes the largest instead: these tests corrupt a
+     * byte and expect a read of some key to notice, and the largest table is the
+     * one most likely to hold the key they then read.
+     */
     private static Path theSSTable(Path dir) throws IOException {
         try (Stream<Path> files = Files.list(dir)) {
-            List<Path> tables = files.filter(p -> p.getFileName().toString().endsWith(".sst")).toList();
-            assertEquals(1, tables.size(), "expected exactly one sstable");
+            List<Path> tables = new java.util.ArrayList<>(
+                    files.filter(p -> p.getFileName().toString().endsWith(".sst")).toList());
+            assertTrue(!tables.isEmpty(), "expected at least one sstable");
+            tables.sort(java.util.Comparator.comparingLong(p -> {
+                try {
+                    return -Files.size(p);
+                } catch (IOException e) {
+                    throw new java.io.UncheckedIOException(e);
+                }
+            }));
             return tables.get(0);
         }
     }

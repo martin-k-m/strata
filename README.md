@@ -250,6 +250,21 @@ Done, the durable write path over a memtable that now spills to disk:
   level. It does less work per compaction than a full merge, so it lowers write
   amplification, and the level each table belongs to is recorded in the manifest,
   so a reopen reads the structure rather than inferring it from file names.
+- **Partitioned level-0 tables.** A flush writes four tables split on key rather
+  than one, so a level-0 table covers a slice of the key space instead of
+  whatever range the workload touched. The compactor then takes the group of
+  level-0 tables whose ranges connect, closed under overlap, and overlaps part of
+  level 1 rather than all of it.
+
+  Two things hold it together and both were learned by getting them wrong. The
+  group is **closed under overlap**, because a table is consumed whole: if an
+  older version of a key went down into level 1 while a newer one stayed in level
+  0, a read would meet the older one first. And the group **grows by key
+  adjacency until it is worth a job**, because with keys written in order the
+  partitioned tables are largely disjoint, the closure is a single table, and
+  level 0 then drains one table per compaction while each flush adds four, so it
+  never shrinks and nothing is reclaimed.
+
 - **Block compression.** Each data block is deflated, and the codec is chosen
   **per block**: the writer keeps whichever of the raw and deflated forms is
   smaller and records which in the block header, so a block that does not
@@ -305,9 +320,6 @@ Done, the durable write path over a memtable that now spills to disk:
 
 Not done yet:
 
-- **Partitioned level-0 tables.** Level-0 tables tend to span the whole key range,
-  so an L0-into-L1 merge still rewrites much of level 1. A real engine limits that
-  with partitioned level-0 tables or a sub-compaction split.
 - **A benchmark run that reflects background compaction, on the machine the
   originals were taken on.** The numbers in [BENCHMARKS.md](docs/BENCHMARKS.md)
   were taken with compaction on the writer's thread, so the write rows there, and

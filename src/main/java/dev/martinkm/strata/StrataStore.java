@@ -178,6 +178,43 @@ public final class StrataStore implements Store {
     private long compactionBytesWritten;
 
     private volatile ConcurrentNavigableMap<Bytes, byte[]> memtable = new ConcurrentSkipListMap<>();
+
+    /**
+     * Approximate heap held by the live memtable, in bytes, or the budget that
+     * bounds it.
+     *
+     * <p>The flush threshold was an entry count and nothing else, which README.md
+     * listed as a gap in exactly these words: "the store does not actually know
+     * how much memory the memtable is using". A thousand two-byte values and a
+     * thousand one-megabyte values are the same number of entries and are not
+     * remotely the same amount of memory, so an entry count bounds the wrong
+     * thing for any workload whose values vary.
+     *
+     * <p>{@code memtableBytes} counts key bytes plus value bytes plus
+     * {@link #ENTRY_OVERHEAD_BYTES} per live entry. It is maintained by delta on
+     * every write, including the replacement of an existing key, so it tracks the
+     * map rather than the traffic: overwriting one key a million times leaves it
+     * where it started. It is an estimate of heap and not a measurement of it,
+     * and the overhead constant is where that shows.
+     */
+    private long memtableBytes;
+
+    /** The byte budget, or 0 for "bound by entry count only". */
+    private final long flushBytes;
+
+    /**
+     * Charged per live memtable entry, on top of the key and value bytes.
+     *
+     * <p>A skip-list node, the two byte arrays' own headers and the {@link Bytes}
+     * wrapper, rounded to something defensible rather than measured: on a 64-bit
+     * JVM with compressed oops a ConcurrentSkipListMap node is 32 bytes, an index
+     * node above it amortises to a few more, and each array carries a 16-byte
+     * header. Being wrong here makes the budget conservative or generous by a
+     * constant factor per entry, which is why the accessor below is public: a
+     * caller sizing a budget can see what the store thinks it is holding rather
+     * than inferring it.
+     */
+    private static final int ENTRY_OVERHEAD_BYTES = 96;
     // Tables by level. levels.get(0) is level 0, newest table first. Each deeper level
     // is a run whose tables are sorted by key and hold disjoint ranges. The whole
     // structure is replaced, never mutated in place, so a lockless reader sees a
@@ -223,10 +260,11 @@ public final class StrataStore implements Store {
     private long writeStalls;
 
     private StrataStore(Path dir, WriteAheadLog wal, int flushThreshold, int cacheBlocks,
-                        boolean fsyncOnWrite) {
+                        boolean fsyncOnWrite, long flushBytes) {
         this.dir = dir;
         this.wal = wal;
         this.flushThreshold = flushThreshold;
+        this.flushBytes = flushBytes;
         this.targetTableEntries = Math.max(1, flushThreshold);
         this.blockCache = new BlockCache(cacheBlocks);
         this.fsyncOnWrite = fsyncOnWrite;
@@ -270,25 +308,60 @@ public final class StrataStore implements Store {
         return open(dir, flushThreshold, cacheBlocks, false);
     }
 
+    /**
+     * Opens a store that flushes when the memtable's estimated heap reaches
+     * {@code maxMemtableBytes}, whichever of that and the entry threshold comes
+     * first.
+     *
+     * <p>This is the bound most callers actually want. An entry count treats a
+     * two-byte value and a one-megabyte value as the same thing, so a store that
+     * holds large values under an entry threshold uses memory nobody chose. Pass
+     * a large {@code flushThreshold} alongside a real byte budget to be bounded
+     * by memory alone.
+     *
+     * <p>The budget is checked after a write is applied, so the memtable can
+     * exceed it by one entry before the flush happens: a store bounded at one
+     * megabyte holding a two-megabyte value will hold that value. Bounding it
+     * beforehand would mean refusing the write, which is a different product.
+     */
+    public static StrataStore openWithMemoryBudget(Path dir, int flushThreshold, long maxMemtableBytes) {
+        if (maxMemtableBytes <= 0) {
+            throw new IllegalArgumentException("maxMemtableBytes must be positive: " + maxMemtableBytes);
+        }
+        return open(dir, flushThreshold, BlockCache.DEFAULT_MAX_BLOCKS, true, maxMemtableBytes);
+    }
+
+    /** The memtable's estimated heap, in bytes, as the flush budget counts it. */
+    public synchronized long memtableBytes() {
+        return memtableBytes;
+    }
+
     private static StrataStore open(Path dir, int flushThreshold, int cacheBlocks,
                                     boolean fsyncOnWrite) {
+        return open(dir, flushThreshold, cacheBlocks, fsyncOnWrite, 0);
+    }
+
+    private static StrataStore open(Path dir, int flushThreshold, int cacheBlocks,
+                                    boolean fsyncOnWrite, long flushBytes) {
         try {
             Files.createDirectories(dir);
         } catch (IOException e) {
             throw new UncheckedIOException("cannot create store directory " + dir, e);
         }
         WriteAheadLog wal = WriteAheadLog.open(dir.resolve("wal.log"));
-        StrataStore store = new StrataStore(dir, wal, flushThreshold, cacheBlocks, fsyncOnWrite);
+        StrataStore store = new StrataStore(dir, wal, flushThreshold, cacheBlocks, fsyncOnWrite, flushBytes);
         store.loadSSTables();
         // Replay rebuilds the memtable in write order, so a later put/delete of a
         // key correctly wins over an earlier one. A delete replays as a tombstone,
         // not a removal, so it still shadows any value the key holds in an SSTable.
         wal.recover((type, key, value) -> {
-            if (type == WriteAheadLog.PUT) {
-                store.memtable.put(Bytes.wrap(key), value);
-            } else {
-                store.memtable.put(Bytes.wrap(key), TOMBSTONE);
-            }
+            // Charged the same way an ordinary write is. A replayed memtable is a
+            // memtable: without this the byte budget would read zero on a store
+            // that had just recovered a full one, and would not fire until enough
+            // new writes had accumulated to reach the budget on their own.
+            byte[] replayed = type == WriteAheadLog.PUT ? value : TOMBSTONE;
+            byte[] previous = store.memtable.put(Bytes.wrap(key), replayed);
+            store.chargeMemtable(key.length, replayed.length, previous);
         });
         store.startCompactor();
         return store;
@@ -310,7 +383,8 @@ public final class StrataStore implements Store {
         wal.append(WriteAheadLog.PUT, key, value);
         if (fsyncOnWrite) wal.sync();
         logicalBytesWritten += (long) key.length + value.length;
-        memtable.put(Bytes.copyOf(key), value.clone());
+        byte[] previous = memtable.put(Bytes.copyOf(key), value.clone());
+        chargeMemtable(key.length, value.length, previous);
         maybeFlush();
         awaitCompactionHeadroom();
     }
@@ -382,7 +456,8 @@ public final class StrataStore implements Store {
         logicalBytesWritten += key.length;
         // A tombstone, not a removal: after a flush this marker must remain to
         // shadow any older on-disk value for the same key.
-        memtable.put(Bytes.copyOf(key), TOMBSTONE);
+        byte[] previousOnDelete = memtable.put(Bytes.copyOf(key), TOMBSTONE);
+        chargeMemtable(key.length, TOMBSTONE.length, previousOnDelete);
         maybeFlush();
         awaitCompactionHeadroom();
     }
@@ -616,6 +691,7 @@ public final class StrataStore implements Store {
         updated.get(0).add(0, table);
         levels = updated;
         memtable = new ConcurrentSkipListMap<>();
+        memtableBytes = 0;
 
         // Before the log is dropped, never after: a crash in between recovers
         // without the table but with the records that rebuild it.
@@ -1114,7 +1190,28 @@ public final class StrataStore implements Store {
     }
 
     private void maybeFlush() {
-        if (memtable.size() >= flushThreshold) flush();
+        if (memtable.size() >= flushThreshold) {
+            flush();
+            return;
+        }
+        if (flushBytes > 0 && memtableBytes >= flushBytes) flush();
+    }
+
+    /**
+     * Adjusts {@link #memtableBytes} for one write.
+     *
+     * <p>By delta, not by addition: {@code previous} is what the key held before,
+     * so replacing a value subtracts the old one and a new key pays the per-entry
+     * overhead once. Counting the traffic instead would make the budget a measure
+     * of how much has been written rather than of how much is held, and a
+     * workload that overwrites one key would flush forever.
+     */
+    private void chargeMemtable(int keyLength, int valueLength, byte[] previous) {
+        if (previous == null) {
+            memtableBytes += ENTRY_OVERHEAD_BYTES + keyLength + valueLength;
+        } else {
+            memtableBytes += (long) valueLength - previous.length;
+        }
     }
 
     /**

@@ -250,6 +250,17 @@ Done, the durable write path over a memtable that now spills to disk:
   level. It does less work per compaction than a full merge, so it lowers write
   amplification, and the level each table belongs to is recorded in the manifest,
   so a reopen reads the structure rather than inferring it from file names.
+- **A byte-budgeted memtable.** `openWithMemoryBudget(dir, entries, bytes)`
+  flushes when the memtable's estimated heap reaches the budget, or when the
+  entry threshold is reached, whichever comes first. An entry count alone bounds
+  the wrong thing: a thousand two-byte values and a thousand one-megabyte values
+  are the same number of entries. The estimate is key bytes plus value bytes plus
+  a per-entry overhead, kept **by delta** on every write, so overwriting one key a
+  million times leaves it where it started; a replayed log is charged the same
+  way, so a recovered memtable is visible to the budget. `memtableBytes()` returns
+  what the store thinks it is holding, because an estimate nobody can read is one
+  nobody can size a budget against.
+
 - **Snapshots.** `snapshot()` returns a read-only view of the store as it stood
   when it was taken, with `get` and `scan` over it. A write made afterwards is
   invisible through it, and so is a delete: a key the snapshot can see stays
@@ -290,8 +301,7 @@ Not done yet:
 - **Block compression** inside an SSTable. Blocks are checksummed and cached now,
   but they are stored uncompressed, so the on-disk size is the raw key and value
   bytes with no attempt to shrink them.
-- **A byte-budgeted memtable.** The flush threshold is an entry count, so the store
-  does not actually know how much memory the memtable is using.
+
 
 The `Store` interface above these does not change as they land. `snapshot()` is
 on `StrataStore` rather than on `Store`, so the interface is still the four

@@ -426,10 +426,108 @@ public final class StrataStore implements Store {
                 });
     }
 
+    /**
+     * A read-only view of the store as it stands now.
+     *
+     * <p>Taken under the store's lock, so it cannot land half way through a
+     * flush: the memtable is copied and the tables are pinned as one act, and a
+     * writer that arrives afterwards changes neither.
+     *
+     * <p>The memtable is <em>copied</em> rather than referenced, and that is the
+     * whole difference between this and what {@link #scan} already did. A
+     * reference would keep seeing the writer's later puts, which is exactly the
+     * property a snapshot exists to deny. The copy is bounded by the flush
+     * threshold, not by the size of the store, and it shares value arrays with
+     * the memtable, which is safe because a put replaces a value rather than
+     * mutating one in place.
+     *
+     * <p>The tables are pinned with the same reference counts a read uses, so a
+     * compaction that runs afterwards publishes its new structure to everyone
+     * else and simply does not delete what this snapshot is standing on.
+     */
+    public synchronized Snapshot snapshot() {
+        java.util.NavigableMap<Bytes, byte[]> frozen = new java.util.TreeMap<>(memtable);
+        List<SSTable> tables = hold();
+        return new HeldSnapshot(frozen, tables);
+    }
+
+    /**
+     * The snapshot returned by {@link #snapshot}.
+     *
+     * <p>It reimplements neither read: {@code get} and {@code scan} are the same
+     * merge the store performs, over a memtable that cannot change and a table
+     * list that cannot be retired, which is what makes the two answer the same
+     * way.
+     */
+    private final class HeldSnapshot implements Snapshot {
+        private final java.util.NavigableMap<Bytes, byte[]> mem;
+        private final List<SSTable> tables;
+        private final java.util.concurrent.atomic.AtomicBoolean closed =
+                new java.util.concurrent.atomic.AtomicBoolean();
+
+        HeldSnapshot(java.util.NavigableMap<Bytes, byte[]> mem, List<SSTable> tables) {
+            this.mem = mem;
+            this.tables = tables;
+        }
+
+        @Override
+        public Optional<byte[]> get(byte[] key) {
+            Objects.requireNonNull(key, "key");
+            requireOpen();
+            byte[] fromMem = mem.get(Bytes.wrap(key));
+            if (fromMem != null) {
+                return fromMem == TOMBSTONE ? Optional.empty() : Optional.of(fromMem.clone());
+            }
+            for (SSTable table : tables) { // newest to oldest
+                SSTable.Result r = table.get(key);
+                if (r.isPresent()) {
+                    return r.isTombstone() ? Optional.empty() : Optional.of(r.value());
+                }
+            }
+            return Optional.empty();
+        }
+
+        @Override
+        public Stream<Map.Entry<byte[], byte[]>> scan(byte[] from, byte[] to) {
+            requireOpen();
+            if (from != null && to != null && Bytes.wrap(from).compareTo(Bytes.wrap(to)) >= 0) {
+                return Stream.empty();
+            }
+            List<Iterator<MergingIterator.Cell>> sources = new ArrayList<>(tables.size() + 1);
+            sources.add(memtableSource(mem, from, to));
+            for (SSTable table : tables) { // newest to oldest
+                sources.add(sstableSource(table.scan(from, to)));
+            }
+            MergingIterator merged = new MergingIterator(sources);
+            Spliterator<MergingIterator.Cell> spliterator = Spliterators.spliteratorUnknownSize(
+                    merged, Spliterator.ORDERED | Spliterator.NONNULL);
+            // No onClose that releases: the snapshot owns the tables, not the
+            // stream. A caller may open several streams from one snapshot, and
+            // releasing on the first close would pull the tables out from under
+            // the others.
+            return StreamSupport.stream(spliterator, false)
+                    .<Map.Entry<byte[], byte[]>>map(cell -> new AbstractMap.SimpleImmutableEntry<>(
+                            cell.key().toArray(), cell.value().clone()));
+        }
+
+        @Override
+        public void close() {
+            if (closed.compareAndSet(false, true)) {
+                for (SSTable table : tables) table.release();
+            }
+        }
+
+        private void requireOpen() {
+            if (closed.get()) {
+                throw new IllegalStateException("snapshot is closed");
+            }
+        }
+    }
+
     /** The memtable rows in {@code [from, to)} as merge cells, tombstones marked. */
     private Iterator<MergingIterator.Cell> memtableSource(
-            ConcurrentNavigableMap<Bytes, byte[]> mem, byte[] from, byte[] to) {
-        ConcurrentNavigableMap<Bytes, byte[]> range;
+            java.util.NavigableMap<Bytes, byte[]> mem, byte[] from, byte[] to) {
+        java.util.NavigableMap<Bytes, byte[]> range;
         if (from == null && to == null) {
             range = mem;
         } else if (from == null) {

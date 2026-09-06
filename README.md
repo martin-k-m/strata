@@ -250,6 +250,27 @@ Done, the durable write path over a memtable that now spills to disk:
   level. It does less work per compaction than a full merge, so it lowers write
   amplification, and the level each table belongs to is recorded in the manifest,
   so a reopen reads the structure rather than inferring it from file names.
+- **Snapshots.** `snapshot()` returns a read-only view of the store as it stood
+  when it was taken, with `get` and `scan` over it. A write made afterwards is
+  invisible through it, and so is a delete: a key the snapshot can see stays
+  readable through it after the store has forgotten it. Two reads through one
+  snapshot, separated by any amount of writing, agree with each other, which a
+  scan alone could not promise.
+
+  It is built on the two things that were already there. The memtable is
+  **copied** at the moment it is taken, because a reference would keep seeing the
+  writer's later puts, which is the property a snapshot exists to deny; the copy
+  is bounded by the flush threshold, not by the size of the store. The on-disk
+  tables are pinned with the same reference counts an ordinary read uses, so a
+  compaction that runs afterwards publishes its new structure to every other
+  reader and simply does not delete the files this snapshot is standing on.
+
+  The cost is that a long-lived snapshot keeps superseded tables on disk, so it
+  is `AutoCloseable` and an unclosed one is a disk leak rather than a wrong
+  answer. `StrataSnapshotTest` pins both halves, including that the store reads
+  `round5` from the new structure while the snapshot reads `first` from the old
+  one at the same moment.
+
 - **Ordered scans.** `scan(from, to)` returns the live pairs with key in
   `[from, to)` in ascending key order, `null` on either bound meaning open on that
   side. It is a k-way merge over one iterator per layer, the memtable and each
@@ -259,10 +280,6 @@ Done, the durable write path over a memtable that now spills to disk:
 
 Not done yet:
 
-- **Snapshots and iterators that outlive a compaction.** The manifest makes the
-  live set change atomically, which is what a snapshot would be built on, but
-  nothing keeps an old set pinned so a reader can go on seeing it. A scan holds
-  references to the tables it is walking and that is the whole of it.
 - **Partitioned level-0 tables.** Level-0 tables tend to span the whole key range,
   so an L0-into-L1 merge still rewrites much of level 1. A real engine limits that
   with partitioned level-0 tables or a sub-compaction split.
@@ -276,7 +293,9 @@ Not done yet:
 - **A byte-budgeted memtable.** The flush threshold is an entry count, so the store
   does not actually know how much memory the memtable is using.
 
-The `Store` interface above these does not change as they land.
+The `Store` interface above these does not change as they land. `snapshot()` is
+on `StrataStore` rather than on `Store`, so the interface is still the four
+operations it was: a store that cannot pin a table set has nothing to return.
 
 ## License
 

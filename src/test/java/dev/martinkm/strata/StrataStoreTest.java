@@ -481,6 +481,27 @@ class StrataStoreTest {
     }
 
     @Test
+    void aClosedStoreRefusesWritesWithAClearError(@TempDir Path dir) {
+        StrataStore store = StrataStore.open(dir);
+        store.put(k("a"), k("1"));
+        store.close();
+        // The log is closed, so the write cannot be made durable. Say so, rather
+        // than surfacing the closed channel the log would otherwise hit.
+        IllegalStateException put = assertThrows(IllegalStateException.class, () -> store.put(k("b"), k("2")));
+        assertTrue(put.getMessage().contains("closed"), put.getMessage());
+        assertThrows(IllegalStateException.class, () -> store.delete(k("a")));
+        assertThrows(IllegalStateException.class, store::snapshot);
+        // Closing twice is not an error.
+        store.close();
+        // The refused write left nothing behind: reopening sees only what was
+        // written before the close.
+        try (StrataStore reopened = StrataStore.open(dir)) {
+            assertArrayEquals(k("1"), reopened.get(k("a")).orElseThrow());
+            assertTrue(reopened.get(k("b")).isEmpty());
+        }
+    }
+
+    @Test
     void matchesTheModelWithATinyBlockCacheThatEvicts(@TempDir Path dir) {
         // A cache of two blocks against a store spread over many tables forces constant
         // eviction. Correctness must not depend on the cache, so the oracle still holds.

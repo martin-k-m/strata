@@ -64,6 +64,13 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   below.
 
 ### Fixed
+- **A write to a closed store now fails as a use-after-close.** `put`, `delete` and
+  `snapshot` on a store after `close()` reached the write-ahead log, which is the
+  first thing close shuts, and failed with `UncheckedIOException: write-ahead log
+  append failed` over a `ClosedChannelException`. That reads as a disk fault. They
+  now throw `IllegalStateException: store is closed`, the same way a closed
+  snapshot already refuses reads. `StrataStoreTest` pins it, including that the
+  refused write leaves nothing behind for a reopen to find.
 - **A compaction could break a concurrent read.** `get` and `scan` snapshot the
   level structure and then read through the tables they found, while compaction
   published the new structure and immediately closed and deleted the tables it

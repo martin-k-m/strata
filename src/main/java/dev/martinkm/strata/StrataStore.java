@@ -400,6 +400,7 @@ public final class StrataStore implements Store {
     public synchronized void put(byte[] key, byte[] value) {
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(value, "value");
+        requireOpen();
         // Log-before-apply: the record is durable before any reader can observe
         // the new value, so a crash can lose a write but never expose one that
         // did not survive.
@@ -474,6 +475,7 @@ public final class StrataStore implements Store {
     @Override
     public synchronized void delete(byte[] key) {
         Objects.requireNonNull(key, "key");
+        requireOpen();
         wal.append(WriteAheadLog.DELETE, key, null);
         if (fsyncOnWrite) wal.sync();
         logicalBytesWritten += key.length;
@@ -544,6 +546,7 @@ public final class StrataStore implements Store {
      * else and simply does not delete what this snapshot is standing on.
      */
     public synchronized Snapshot snapshot() {
+        requireOpen();
         java.util.NavigableMap<Bytes, byte[]> frozen = new java.util.TreeMap<>(memtable);
         List<SSTable> tables = hold();
         return new HeldSnapshot(frozen, tables);
@@ -1175,6 +1178,16 @@ public final class StrataStore implements Store {
             out.add(SSTable.open(path, blockCache));
         }
         return new Output(out, bytes);
+    }
+
+    /**
+     * Refuses a write or a snapshot once {@link #close} has begun. Without this
+     * the write reached the log, which is the first thing close shuts, and the
+     * caller got {@code write-ahead log append failed} over a closed channel:
+     * true, but it reads as a disk fault rather than a use-after-close.
+     */
+    private void requireOpen() {
+        if (closing) throw new IllegalStateException("store is closed: " + dir);
     }
 
     @Override

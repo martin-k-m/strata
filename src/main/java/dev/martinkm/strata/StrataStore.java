@@ -487,6 +487,42 @@ public final class StrataStore implements Store {
         awaitCompactionHeadroom();
     }
 
+    /**
+     * Applies every operation in {@code batch} as one unit: one log record, one
+     * fsync, and one pass over the memtable under the writer's lock.
+     *
+     * <p>Atomicity comes from the log framing. The batch is a single record under
+     * a single CRC, so recovery after a crash mid-append drops all of it, the same
+     * way it drops a torn single record, and never replays a prefix. Visibility
+     * comes from the lock: {@code get} and {@code scan} read the memtable without
+     * locking, so a reader can observe the batch half applied. What it cannot do is
+     * observe a later write ordered before an earlier one, because the operations
+     * go into the memtable in batch order and a put replaces a value whole.
+     *
+     * <p>One fsync per batch rather than one per operation is also what makes this
+     * the cheap way to write many keys: the fsync is most of what a single
+     * {@code put} costs, and here it is paid once.
+     *
+     * <p>An empty batch writes nothing and returns at once. The batch is not
+     * consumed; the caller may {@link WriteBatch#clear} and reuse it.
+     */
+    public synchronized void write(WriteBatch batch) {
+        Objects.requireNonNull(batch, "batch");
+        requireOpen();
+        List<WriteAheadLog.Record> records = batch.records();
+        if (records.isEmpty()) return;
+        wal.appendBatch(records);
+        if (fsyncOnWrite) wal.sync();
+        for (WriteAheadLog.Record r : records) {
+            byte[] value = r.type() == WriteAheadLog.PUT ? r.value().clone() : TOMBSTONE;
+            logicalBytesWritten += r.key().length + (r.value() == null ? 0 : r.value().length);
+            byte[] previous = memtable.put(Bytes.copyOf(r.key()), value);
+            chargeMemtable(r.key().length, value.length, previous);
+        }
+        maybeFlush();
+        awaitCompactionHeadroom();
+    }
+
     @Override
     public Stream<Map.Entry<byte[], byte[]>> scan(byte[] from, byte[] to) {
         // Snapshot the layers the way get() does: a concurrent flush publishes its

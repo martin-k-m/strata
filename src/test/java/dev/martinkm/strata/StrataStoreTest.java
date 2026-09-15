@@ -490,6 +490,7 @@ class StrataStoreTest {
         IllegalStateException put = assertThrows(IllegalStateException.class, () -> store.put(k("b"), k("2")));
         assertTrue(put.getMessage().contains("closed"), put.getMessage());
         assertThrows(IllegalStateException.class, () -> store.delete(k("a")));
+        assertThrows(IllegalStateException.class, () -> store.write(new WriteBatch().put(k("b"), k("2"))));
         assertThrows(IllegalStateException.class, store::snapshot);
         // Closing twice is not an error.
         store.close();

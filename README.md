@@ -80,6 +80,10 @@ open(dir) ── load the SSTables, then replay the log on top, truncating any t
 Logging *before* applying is the whole game: the durable record can never be
 behind what a reader has already observed.
 
+`write(batch)` takes the same path for a group of puts and deletes at once. The
+batch is one log record under one CRC, so it is fsynced once and, after a crash,
+recovered whole or not at all.
+
 When the memtable crosses a size threshold it is flushed to an immutable sorted
 file, an SSTable, and the log is rolled empty so both memory and log stay
 bounded. A read checks the memtable first, then walks the SSTables newest to
@@ -311,6 +315,20 @@ Done, the durable write path over a memtable that now spills to disk:
   `round5` from the new structure while the snapshot reads `first` from the old
   one at the same moment.
 
+- **Write batches.** `write(batch)` applies a `WriteBatch` of puts and deletes
+  as one unit. The batch goes to the log as a single record under a single CRC,
+  so a crash during the append loses all of it or none of it, and recovery
+  never replays a prefix of a batch the way a run of single records would tear.
+  `StrataWriteBatchTest` truncates the log at every byte inside a batch's record
+  and flips every byte of it, and reopens on each; the writes before the batch
+  are intact every time and none of the batch's operations leaks through.
+
+  It is also the cheap way to write many keys, because the fsync is paid once
+  per batch rather than once per operation. What it does not promise is
+  isolation from a concurrent reader: `get` and `scan` take no lock, so a reader
+  can see a batch half applied. It sees operations in batch order, never a later
+  one before an earlier one, and a later write of the same key in the batch wins.
+
 - **Ordered scans.** `scan(from, to)` returns the live pairs with key in
   `[from, to)` in ascending key order, `null` on either bound meaning open on that
   side. It is a k-way merge over one iterator per layer, the memtable and each
@@ -333,9 +351,10 @@ Not done yet:
 
 
 
-The `Store` interface above these does not change as they land. `snapshot()` is
-on `StrataStore` rather than on `Store`, so the interface is still the four
-operations it was: a store that cannot pin a table set has nothing to return.
+The `Store` interface above these does not change as they land. `snapshot()`
+and `write(batch)` are on `StrataStore` rather than on `Store`, so the interface
+is still the four operations it was: a store that cannot pin a table set has
+nothing to return, and one without a log has no unit to make atomic.
 
 ## License
 

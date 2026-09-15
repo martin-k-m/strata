@@ -7,6 +7,17 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Write batches.** `WriteBatch` collects puts and deletes and
+  `StrataStore.write(batch)` applies them as one unit. The batch is appended to
+  the write-ahead log as a single record with a single CRC, so it is fsynced
+  once rather than once per operation, and a crash during the append loses the
+  whole batch or none of it. Recovery reads a batch record and replays each
+  operation in it; a torn or corrupt one is dropped as the tail the way a torn
+  single record is. Operations apply in batch order, so a later write of a key
+  in the same batch wins, and a batch that crosses the flush threshold or the
+  memory budget flushes the way a run of single puts would. It does not isolate
+  a concurrent reader, which can see a batch half applied. `StrataWriteBatchTest`
+  reopens on every truncation and every byte flip inside a batch's record.
 - `docs/BENCHMARKS.md`: measurements of write throughput, point read latency split
   by whether the key is in the memtable, on disk or absent, scan throughput, write
   and space amplification, read latency during a compaction against at rest, the

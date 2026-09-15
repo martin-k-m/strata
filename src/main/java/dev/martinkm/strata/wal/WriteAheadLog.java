@@ -6,6 +6,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.List;
 import java.util.zip.CRC32;
 
 /**
@@ -27,11 +28,28 @@ import java.util.zip.CRC32;
  * mid-append, so recovery reads until a record is short or fails its CRC, then
  * truncates the file to the last whole record. That is the difference between a
  * log that recovers and one that refuses to open after a hard kill.
+ *
+ * <p>A batch is one record holding several operations:
+ *
+ * <pre>
+ *   [payloadLen: int][crc32: int][ BATCH | count: int | (type | keyLen | key | valLen | value)* ]
+ * </pre>
+ *
+ * The batch shares one length prefix and one CRC, so the tear-the-tail rule
+ * makes it atomic for free: a crash mid-append leaves a short or CRC-failing
+ * record, and recovery drops the whole batch rather than a prefix of it. Nothing
+ * else in this class knows a batch from a run of single records; {@link #recover}
+ * hands the visitor one operation at a time either way.
  */
 public final class WriteAheadLog implements AutoCloseable {
 
     public static final byte PUT = 1;
     public static final byte DELETE = 2;
+    /** A record type that frames several operations as one unit of recovery. */
+    public static final byte BATCH = 3;
+
+    /** One operation, as written to and read back from the log. A null value is a delete. */
+    public record Record(byte type, byte[] key, byte[] value) {}
 
     /** Receives each record during {@link #recover}, in the order it was written. */
     @FunctionalInterface
@@ -98,15 +116,16 @@ public final class WriteAheadLog implements AutoCloseable {
                 if ((int) crc.getValue() != expectedCrc) break; // corrupt tail
 
                 byte type = payload.get();
-                byte[] key = new byte[payload.getInt()];
-                payload.get(key);
-                int valLen = payload.getInt();
-                byte[] value = null;
-                if (valLen >= 0) {
-                    value = new byte[valLen];
-                    payload.get(value);
+                if (type == BATCH) {
+                    // The CRC already vouched for the whole record, so every
+                    // operation in it is replayed: a batch is all or nothing.
+                    int count = payload.getInt();
+                    for (int i = 0; i < count; i++) {
+                        visitOne(payload.get(), payload, visitor);
+                    }
+                } else {
+                    visitOne(type, payload, visitor);
                 }
-                visitor.visit(type, key, value);
                 pos += 8 + payloadLen;
             }
             if (pos < channel.size()) {
@@ -118,17 +137,60 @@ public final class WriteAheadLog implements AutoCloseable {
         }
     }
 
+    /** Reads one operation's key and value out of {@code payload} and hands it on. */
+    private static void visitOne(byte type, ByteBuffer payload, Visitor visitor) {
+        byte[] key = new byte[payload.getInt()];
+        payload.get(key);
+        int valLen = payload.getInt();
+        byte[] value = null;
+        if (valLen >= 0) {
+            value = new byte[valLen];
+            payload.get(value);
+        }
+        visitor.visit(type, key, value);
+    }
+
     /** Appends one record. Not durable until {@link #sync} returns. */
     public synchronized void append(byte type, byte[] key, byte[] value) {
-        int keyLen = key.length;
-        int valLen = (value == null) ? -1 : value.length;
-        int payloadLen = 1 + 4 + keyLen + 4 + Math.max(valLen, 0);
+        ByteBuffer payload = ByteBuffer.allocate(1 + opLength(key, value));
+        payload.put(type);
+        putOp(payload, key, value);
+        payload.flip();
+        write(payload);
+    }
+
+    /**
+     * Appends every record in {@code records} as one log record, so a crash
+     * during the append loses all of them or none. An empty list appends nothing.
+     * Not durable until {@link #sync} returns.
+     */
+    public synchronized void appendBatch(List<Record> records) {
+        if (records.isEmpty()) return;
+        int payloadLen = 1 + 4;
+        for (Record r : records) payloadLen += 1 + opLength(r.key(), r.value());
 
         ByteBuffer payload = ByteBuffer.allocate(payloadLen);
-        payload.put(type).putInt(keyLen).put(key).putInt(valLen);
-        if (valLen >= 0) payload.put(value);
+        payload.put(BATCH).putInt(records.size());
+        for (Record r : records) {
+            payload.put(r.type());
+            putOp(payload, r.key(), r.value());
+        }
         payload.flip();
+        write(payload);
+    }
 
+    private static int opLength(byte[] key, byte[] value) {
+        return 4 + key.length + 4 + (value == null ? 0 : value.length);
+    }
+
+    private static void putOp(ByteBuffer payload, byte[] key, byte[] value) {
+        payload.putInt(key.length).put(key).putInt(value == null ? -1 : value.length);
+        if (value != null) payload.put(value);
+    }
+
+    /** Frames {@code payload} with its length and CRC and hands it to the channel. */
+    private void write(ByteBuffer payload) {
+        int payloadLen = payload.remaining();
         CRC32 crc = new CRC32();
         crc.update(payload.duplicate());
 

@@ -6,6 +6,8 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-16
+
 ### Added
 - **Write batches.** `WriteBatch` collects puts and deletes and
   `StrataStore.write(batch)` applies them as one unit. The batch is appended to
@@ -102,9 +104,7 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   also removes the caveat on `Store.scan` that a scan should not run alongside a
   compaction, which had contradicted the store's own concurrency claim.
 
-## [0.1.0]
-
-### Added
+### Added (foundational)
 - Durable write path with a write-ahead log and crash recovery.
 - SSTable flush from the in-memory memtable, the read path across layers, and
   compaction.
@@ -114,5 +114,5 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A command-line interface over the store.
 - MIT license and continuous integration.
 
-[Unreleased]: https://github.com/martin-k-m/strata/compare/main...HEAD
+[Unreleased]: https://github.com/martin-k-m/strata/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/martin-k-m/strata/releases/tag/v0.1.0
